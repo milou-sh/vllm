@@ -91,6 +91,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 register_nccl_symmetric_ops(self.pynccl_comm)
 
         self.ca_comm: CustomAllreduce | None = None
+        self.push_ar_comm = None
         self.qr_comm: QuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
@@ -132,6 +133,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # On ROCm, 'use_custom_allreduce==True' means it must currently be
             # an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+
+        if (
+            use_custom_allreduce
+            and self.world_size > 1
+            and current_platform.is_cuda()
+            and self.ca_comm is not None
+            and not self.ca_comm.disabled
+        ):
+            try:
+                from vllm.distributed.device_communicators.push_all_reduce import (
+                    PushAllReduce,
+                )
+
+                self.push_ar_comm = PushAllReduce(
+                    group=self.cpu_group, device=self.device
+                )
+                if self.push_ar_comm.disabled:
+                    self.push_ar_comm = None
+            except Exception:
+                self.push_ar_comm = None
 
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
@@ -310,6 +331,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = aiter_ar_comm.custom_all_reduce(input_)
             assert out is not None
             return out
+        push_ar_comm = self.push_ar_comm
+        if push_ar_comm is not None and push_ar_comm.should_use(input_):
+            out = push_ar_comm.all_reduce(input_)
+            if out is not None:
+                return out
         ca_comm = self.ca_comm
         if (
             ca_comm is not None
