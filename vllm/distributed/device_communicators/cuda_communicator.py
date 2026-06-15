@@ -245,6 +245,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "QUICK_REDUCE",
             "FLASHINFER",
             "AITER_CUSTOM",
+            "PUSH_AR",
             "CUSTOM",
             "SYMM_MEM",
             "PYNCCL",
@@ -280,6 +281,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             enabled_ar_backends.append("FLASHINFER")
         if self.aiter_ar_comm is not None and not self.aiter_ar_comm.disabled:
             enabled_ar_backends.append("AITER_CUSTOM")
+        if self.push_ar_comm is not None:
+            enabled_ar_backends.append("PUSH_AR")
         if self.ca_comm is not None and not self.ca_comm.disabled:
             enabled_ar_backends.append("CUSTOM")
         if self.symm_mem_comm is not None and not self.symm_mem_comm.disabled:
