@@ -90,6 +90,7 @@ class TopKTopPSampler(nn.Module):
         super().__init__()
         self.logprobs_mode = logprobs_mode
         self.use_fp64_gumbel = use_fp64_gumbel
+        self._use_flashinfer = False
         if current_platform.is_cuda():
             # FlashInfer doesn't expose post-top-k/top-p logits/logprobs,
             # so it can't be used when the configured mode requires them.
@@ -97,6 +98,7 @@ class TopKTopPSampler(nn.Module):
                 logprobs_mode not in PROCESSED_LOGPROBS_MODES
                 and flashinfer_sampler_supported()
             )
+            self._use_flashinfer = can_use_flashinfer
             self.forward = (
                 self.forward_cuda if can_use_flashinfer else self.forward_native
             )
@@ -127,6 +129,20 @@ class TopKTopPSampler(nn.Module):
             self.forward = self.forward_hip
         else:
             self.forward = self.forward_native
+
+    def will_use_flashinfer(
+        self,
+        generators: dict[int, torch.Generator],
+        k: torch.Tensor | None,
+        p: torch.Tensor | None,
+    ) -> bool:
+        """Return whether this request batch will use FlashInfer sampling."""
+        return (
+            self._use_flashinfer
+            and (k is not None or p is not None)
+            and not generators
+            and not self.use_fp64_gumbel
+        )
 
     def forward_native(
         self,
@@ -163,7 +179,7 @@ class TopKTopPSampler(nn.Module):
         # Fall back to the PyTorch-native path when FlashInfer has nothing
         # to do (no top-k / top-p filter) or when per-request generators
         # are present (unsupported by FlashInfer 0.2.3+).
-        if (k is None and p is None) or generators:
+        if not self.will_use_flashinfer(generators, k, p):
             if generators:
                 logger.debug_once(
                     "FlashInfer 0.2.3+ does not support "
