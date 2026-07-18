@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import functools
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 
 import numpy as np
 import torch
@@ -9,6 +8,7 @@ import torch
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.triton_utils import tl, triton
+from vllm.utils.flashinfer import get_flashinfer_top_p_renorm_probs
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 from vllm.v1.worker.gpu.input_batch import (
@@ -46,15 +46,6 @@ def _iter_request_chunks(
         end = min(num_reqs, max(start + 1, end))
         yield start, end
         start = end
-
-
-@functools.cache
-def _get_flashinfer_top_p_renorm_probs() -> Callable[..., torch.Tensor] | None:
-    try:
-        from flashinfer.sampling import top_p_renorm_probs
-    except (ImportError, AttributeError):
-        return None
-    return top_p_renorm_probs
 
 
 @triton.jit
@@ -101,7 +92,7 @@ class RejectionSampler:
         elif rejection_sample_method == "block":
             self.use_block_verification = True
         self.flashinfer_top_p_renorm_probs = (
-            _get_flashinfer_top_p_renorm_probs() if sampler.use_flashinfer else None
+            get_flashinfer_top_p_renorm_probs() if sampler.use_flashinfer else None
         )
 
     def _get_logprobs_tensors(
