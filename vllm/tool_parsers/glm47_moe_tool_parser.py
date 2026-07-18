@@ -16,13 +16,20 @@ import regex as re
 
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
-from vllm.tool_parsers.abstract_tool_parser import Tool
+from vllm.tool_parsers.abstract_tool_parser import Tool, ToolParser
 from vllm.tool_parsers.glm4_moe_tool_parser import Glm4MoeModelToolParser
 
 logger = init_logger(__name__)
 
 
 class Glm47MoeModelToolParser(Glm4MoeModelToolParser):
+    supports_required_and_named = True
+
+    def adjust_request(self, request):
+        request = ToolParser.adjust_request(self, request)
+        if request.tools and request.tool_choice != "none":
+            request.skip_special_tokens = False
+        return request
 
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
