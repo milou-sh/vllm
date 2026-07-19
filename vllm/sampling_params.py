@@ -54,6 +54,21 @@ def validate_thinking_token_budget(value: int | float | bool | None) -> int | No
     return value
 
 
+def resolve_thinking_token_budget(
+    value: int | float | bool | None, max_tokens: int
+) -> int | None:
+    """Apply the server default while reserving half the output window."""
+    value = validate_thinking_token_budget(value)
+    if value is not None:
+        return value
+    default = validate_thinking_token_budget(
+        envs.VLLM_DEFAULT_THINKING_TOKEN_BUDGET
+    )
+    if default is None:
+        return None
+    return min(default, max_tokens // 2)
+
+
 ThinkingTokenBudget = Annotated[
     int | None,
     BeforeValidator(validate_thinking_token_budget),
@@ -439,8 +454,8 @@ class SamplingParams(
         if self.seed == -1:
             self.seed = None
 
-        self.thinking_token_budget = validate_thinking_token_budget(
-            self.thinking_token_budget
+        self.thinking_token_budget = resolve_thinking_token_budget(
+            self.thinking_token_budget, self.max_tokens
         )
 
         if self.stop is None:

@@ -14,7 +14,7 @@ from vllm.entrypoints.openai.responses.protocol import (
     ResponsesRequest,
     ResponseTextConfig,
 )
-from vllm.sampling_params import StructuredOutputsParams
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 
 
 class TestResponsesRequestSamplingParams:
@@ -154,3 +154,40 @@ class TestResponsesRequestSamplingParams:
         assert "Cannot specify both structured_outputs and text.format" in str(
             exc_info.value
         )
+
+    def test_server_default_thinking_budget(self, monkeypatch):
+        """Test the server default applies without a request field."""
+        monkeypatch.setenv("VLLM_DEFAULT_THINKING_TOKEN_BUDGET", "4096")
+        request = ResponsesRequest(
+            model="test-model",
+            input="test input",
+            max_output_tokens=16384,
+        )
+
+        sampling_params = request.to_sampling_params(default_max_tokens=16384)
+
+        assert sampling_params.thinking_token_budget == 4096
+
+    def test_server_default_thinking_budget_reserves_output(self, monkeypatch):
+        """Test the default leaves half the output window available."""
+        monkeypatch.setenv("VLLM_DEFAULT_THINKING_TOKEN_BUDGET", "4096")
+        request = ResponsesRequest(
+            model="test-model",
+            input="test input",
+            max_output_tokens=4096,
+        )
+
+        sampling_params = request.to_sampling_params(default_max_tokens=4096)
+
+        assert sampling_params.thinking_token_budget == 2048
+
+    def test_request_thinking_budget_overrides_server_default(self, monkeypatch):
+        """Test an explicit request budget remains authoritative."""
+        monkeypatch.setenv("VLLM_DEFAULT_THINKING_TOKEN_BUDGET", "4096")
+
+        sampling_params = SamplingParams(
+            max_tokens=4096,
+            thinking_token_budget=1024,
+        )
+
+        assert sampling_params.thinking_token_budget == 1024
