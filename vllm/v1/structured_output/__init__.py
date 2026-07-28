@@ -290,7 +290,11 @@ class StructuredOutputManager:
                     self._fill_bitmasks(
                         ((grammar, cumulative_index, apply_bitmask),)
                     )
-                    advance_grammar = apply_bitmask
+                    # Only advance the FSM over drafts that were themselves
+                    # grammar-constrained. Once reasoning ends mid-window the
+                    # drafts that follow the marker predate the bitmask, so we
+                    # stop advancing rather than feed them to accept_tokens.
+                    advance_grammar = apply_bitmask and not post_reasoning_end_in_window
                     if token == -1:
                         apply_bitmask = False
                         advance_grammar = False
@@ -301,17 +305,23 @@ class StructuredOutputManager:
                             simulated_buffer = history + list(request_tokens)
                         simulated = simulated_buffer[: history_length + index + 1]
                         if reasoner.is_reasoning_end_streaming(simulated, [token]):
+                            # Reasoning ended mid-window. Constrain the rest of
+                            # the window via bitmask, but do not advance the FSM
+                            # through the marker or the drafts that follow it:
+                            # they were sampled before the grammar became active
+                            # and are not guaranteed to satisfy it.
                             apply_bitmask = True
                             advance_grammar = False
                             post_reasoning_end_in_window = True
                     if advance_grammar and not grammar.is_terminated():
-                        accepted = grammar.accept_tokens(req_id, [token])
-                        if accepted:
-                            state_advancements += 1
-                        elif not post_reasoning_end_in_window:
+                        if not grammar.accept_tokens(req_id, [token]):
+                            # A grammar-constrained draft must always be
+                            # accepted; a rejection means the bitmask and the
+                            # FSM disagree, which is a real invariant violation.
                             raise AssertionError(
                                 (token, req_id, scheduled_spec_decode_tokens)
                             )
+                        state_advancements += 1
                     cumulative_index += 1
                 bonus_apply = self.should_fill_bitmask(request) or apply_bitmask
                 self._fill_bitmasks(

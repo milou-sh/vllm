@@ -85,6 +85,16 @@ class TestGlm47ExtractToolCalls:
         assert r.tools_called
         assert json.loads(r.tool_calls[0].function.arguments) == {"city": "Beijing"}
 
+    def test_recovers_dropped_arg_key_open(self, glm47_tool_parser, mock_request):
+        # GLM occasionally omits the opening <arg_key> tag, emitting
+        # ``name key</arg_key><arg_value>value</arg_value>``. The argument must
+        # still be recovered instead of dropping the whole tool call.
+        out = "<tool_call>get_weather city</arg_key><arg_value>Beijing</arg_value></tool_call>"
+        r = glm47_tool_parser.extract_tool_calls(out, request=mock_request)
+        assert r.tools_called
+        assert r.tool_calls[0].function.name == "get_weather"
+        assert json.loads(r.tool_calls[0].function.arguments) == {"city": "Beijing"}
+
     def test_args_with_newlines(self, glm47_tool_parser, mock_request):
         out = "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n</tool_call>"
         r = glm47_tool_parser.extract_tool_calls(out, request=mock_request)

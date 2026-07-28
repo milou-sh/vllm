@@ -258,3 +258,52 @@ class TestReasoningStructuredOutput:
 
         # Should return True since reasoning has ended
         assert result is True
+
+    def test_grammar_bitmask_does_not_advance_post_reasoning_drafts(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        """Reasoning ending inside a speculative window must not advance the
+        FSM over the drafts that follow the marker.
+
+        Those drafts were sampled before the grammar became active, so feeding
+        them to ``accept_tokens`` logs a spurious "Failed to advance FSM" error
+        on every reasoning boundary. The grammar is still constrained via the
+        bitmask; only the (unreliable) advance is skipped.
+        """
+        import torch
+
+        manager = manager_with_reasoner
+        # Enable speculative decoding with a 3-token window.
+        manager.vllm_config.speculative_config = Mock()
+        manager.vllm_config.speculative_config.num_speculative_tokens = 3
+
+        # Real bitmask tensor so _fill_bitmasks can write into it.
+        manager.backend = Mock()
+        manager.backend.allocate_token_bitmask = Mock(
+            return_value=torch.zeros((512, 1563), dtype=torch.int32)
+        )
+
+        request = mock_request_with_structured_output
+        request.structured_output_request.reasoning_ended = None
+        grammar = request.structured_output_request.grammar
+        grammar.accept_tokens = Mock(return_value=True)
+
+        # Reasoning ends on the marker token (id 11), the middle of the window.
+        reasoner = MockReasoner(tokenizer=Mock())
+        reasoner.is_reasoning_end.return_value = False
+        reasoner.is_reasoning_end_streaming.side_effect = (
+            lambda _history, delta: list(delta) == [11]
+        )
+        request.structured_output_request.reasoner = reasoner
+
+        req_id = "req-0"
+        manager.grammar_bitmask(
+            requests={req_id: request},
+            structured_output_request_ids=[req_id],
+            scheduled_spec_decode_tokens={req_id: [10, 11, 12]},
+        )
+
+        # The FSM must never be advanced over the un-constrained drafts.
+        grammar.accept_tokens.assert_not_called()
