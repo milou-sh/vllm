@@ -34,13 +34,20 @@ class Glm47MoeModelToolParser(Glm4MoeModelToolParser):
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
         # GLM-4.7 format: <tool_call>func_name[<arg_key>...]*</tool_call>
-        # The function name can be followed by a newline, whitespace, or
-        # directly by <arg_key> tags (no separator).  The arg section is
-        # optional so that zero-argument calls are supported.
+        # The function name is the first token: it ends at whitespace or the
+        # first tag ('<'), so it works whether the name is followed by a
+        # newline, whitespace, or directly by an arg tag.  The argument section
+        # is captured as-is and may be empty (zero-argument calls) or slightly
+        # malformed (recovered by func_arg_regex), rather than failing the
+        # whole tool call.
         self.func_detail_regex = re.compile(
-            r"<tool_call>\s*(\S+?)\s*(<arg_key>.*)?</tool_call>", re.DOTALL
+            r"<tool_call>\s*([^\s<]+)\s*(.*?)</tool_call>", re.DOTALL
         )
+        # The opening <arg_key> is optional: GLM occasionally drops it and emits
+        # ``key</arg_key><arg_value>value</arg_value>``, which would otherwise
+        # lose the argument.  Keys never contain '<', so matching the key as
+        # non-'<' keeps the recovery from swallowing a neighbouring tag.
         self.func_arg_regex = re.compile(
-            r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+            r"(?:<arg_key>)?([^<]*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
             re.DOTALL,
         )
