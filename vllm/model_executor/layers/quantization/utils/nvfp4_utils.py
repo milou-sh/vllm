@@ -61,6 +61,93 @@ def cutlass_fp4_supported() -> bool:
     return cutlass_scaled_mm_supports_fp4(capability)
 
 
+# Block shape for the FP8 re-quantization used by the Hopper fp8-compute path.
+FP8_COMPUTE_BLOCK_SIZE: list[int] = [128, 128]
+
+# Elements per NVFP4 block scale, as defined by the format itself. Distinct from
+# FP8_COMPUTE_BLOCK_SIZE, which is the shape of the FP8 blocks we re-quantize to.
+NVFP4_GROUP_SIZE: int = 16
+
+
+def _is_hopper_without_native_fp4() -> bool:
+    """True when running on Hopper (SM90) without native FP4 tensor cores.
+
+    Such GPUs otherwise fall back to Marlin, which dequantizes FP4->FP16 and
+    computes on FP16 tensor cores (989 TFLOPS on H200). Converting the weights
+    to FP8 once at load time lets the same math run on native FP8 tensor cores
+    (3,958 TFLOPS) instead. DeepGEMM is required because it supplies the
+    block-scaled FP8 MoE kernels the converted weights are fed to.
+    """
+    from vllm.utils.deep_gemm import is_deep_gemm_supported
+
+    return (
+        current_platform.is_cuda()
+        and current_platform.has_device_capability(90)
+        and not cutlass_fp4_supported()
+        and is_deep_gemm_supported()
+    )
+
+
+def ensure_e2m1_table_on_device(device: torch.device) -> None:
+    """Move the shared E2M1 lookup table used by the FP4 dequantizer to device.
+
+    ``break_fp4_bytes`` indexes this module-level table with a tensor that lives
+    on the weight's device, and torch requires both to be co-located. The table
+    is created on CPU at import time, so every dequantize entry point has to do
+    this first; the Marlin and emulation paths do the same.
+    """
+    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+        kE2M1ToFloat_handle,
+    )
+
+    if kE2M1ToFloat_handle.val.device != device:
+        kE2M1ToFloat_handle.val = kE2M1ToFloat_handle.val.to(device)
+
+
+def convert_nvfp4_weight_to_fp8_block(
+    weight_fp4: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+    block_size: list[int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert a packed NVFP4 weight to an FP8 block-quantized weight.
+
+    Dequantizes FP4 to BF16, then re-quantizes to FP8 with block scaling.
+
+    Args:
+        weight_fp4: Packed uint8 FP4 weights, shape (N, K/2).
+        weight_scale: Per-block FP8-E4M3 scales, shape (N, K/group_size).
+        weight_global_scale: Scalar FP32 global scale.
+        block_size: FP8 block shape, default ``FP8_COMPUTE_BLOCK_SIZE``.
+
+    Returns:
+        (weight_fp8, weight_scale_fp32) in (N, K) layout.
+    """
+    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+        dequantize_to_dtype,
+    )
+    from vllm.utils.deep_gemm import per_block_cast_to_fp8
+
+    if block_size is None:
+        block_size = FP8_COMPUTE_BLOCK_SIZE
+
+    ensure_e2m1_table_on_device(weight_fp4.device)
+
+    # swizzle=False: this runs before any kernel-specific scale swizzling, so
+    # the block scales are still in the checkpoint's linear layout.
+    weight_bf16 = dequantize_to_dtype(
+        weight_fp4.view(torch.uint8),
+        weight_scale,
+        weight_global_scale,
+        torch.bfloat16,
+        block_size=NVFP4_GROUP_SIZE,
+        swizzle=False,
+    )
+
+    # per_block_cast_to_fp8 preserves the (N, K) layout.
+    return per_block_cast_to_fp8(weight_bf16, block_size)
+
+
 def pad_nvfp4_weight_for_cutlass(
     weight: torch.Tensor,
     alignment: int = 32,
