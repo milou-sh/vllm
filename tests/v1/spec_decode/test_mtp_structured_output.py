@@ -5,7 +5,7 @@
 import pytest
 from transformers import AutoTokenizer
 
-from vllm.config import StructuredOutputsConfig, VllmConfig
+from vllm.config import DeviceConfig, StructuredOutputsConfig, VllmConfig
 from vllm.config.model import ModelConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
@@ -21,6 +21,7 @@ def _make_manager_and_request(backend: str, prompt_str: str = '{"a": "b"}'):
     prompt = tokenizer.encode(prompt_str)
 
     vllm_config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
         model_config=ModelConfig(tokenizer=TOKENIZER),
         structured_outputs_config=StructuredOutputsConfig(backend=backend),
         speculative_config=SpeculativeConfig(
@@ -309,6 +310,21 @@ def test_should_advance_records_reasoning_end_index():
     assert manager.should_advance(request)
     assert structured_req.reasoning_ended
     # Marker sits at absolute index len(prompt) + 1.
+    assert structured_req.reasoning_end_token_index == len(prompt) + 1
+
+
+def test_should_advance_uses_accepted_mtp_tokens_as_delta():
+    tokenizer, manager, request, prompt, marker = _setup_boundary_request("xgrammar")
+    structured_req = request.structured_output_request
+
+    pre = tokenizer.encode(" ")[0]
+    post = tokenizer.encode("{")[0]
+    step_tokens = [pre, marker, post]
+    request.append_output_token_ids(step_tokens)
+    request.num_computed_tokens = len(request.all_token_ids) + NUM_SPEC_TOKENS
+
+    assert manager.should_advance(request, step_tokens)
+    assert structured_req.reasoning_ended
     assert structured_req.reasoning_end_token_index == len(prompt) + 1
 
 
