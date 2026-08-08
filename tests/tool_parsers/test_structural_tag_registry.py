@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -189,7 +192,6 @@ def test_get_model_structural_tag_supports_named_tool_choice(
         (DeepSeekV31ToolParser, "deepseek_v3_1"),
         (DeepSeekV32EngineToolParser, "deepseek_v3_2"),
         (DeepSeekV4EngineToolParser, "deepseek_v4"),
-        (Glm47MoeModelToolParser, "glm_4_7"),
         (Hermes2ProToolParser, "hermes"),
         (KimiK2ToolParser, "kimi"),
         (Llama3JsonToolParser, "llama"),
@@ -208,6 +210,26 @@ def test_tool_parsers_without_structural_tag_support_required_and_named():
 
     assert NonStructuralTagToolParser.structural_tag_model is None
     assert NonStructuralTagToolParser.supports_required_and_named
+
+
+def test_glm47_supports_required_and_named_without_strict_tool_calling():
+    env = os.environ.copy()
+    env["VLLM_ENFORCE_STRICT_TOOL_CALLING"] = "0"
+    output = subprocess.check_output(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from vllm.tool_parsers.glm47_moe_tool_parser "
+                "import Glm47MoeModelToolParser; "
+                "print(Glm47MoeModelToolParser.supports_required_and_named)"
+            ),
+        ],
+        env=env,
+        text=True,
+    )
+
+    assert output.strip().splitlines()[-1] == "True"
 
 
 def test_non_structural_tag_parser_uses_schema_constraints(

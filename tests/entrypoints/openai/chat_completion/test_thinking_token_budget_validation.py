@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
+from vllm.sampling_params import SamplingParams
 
 
 @pytest.mark.parametrize("raw_value", [-2, 0.6, 10.5])
@@ -74,3 +75,14 @@ def test_completion_request_accepts_minus_one_as_unlimited():
         }
     )
     assert request.thinking_token_budget is None
+
+
+def test_server_default_thinking_budget(monkeypatch):
+    monkeypatch.setenv("VLLM_DEFAULT_THINKING_TOKEN_BUDGET", "1024")
+
+    assert SamplingParams(max_tokens=4096).thinking_token_budget == 1024
+    assert SamplingParams(max_tokens=512).thinking_token_budget == 256
+    assert (
+        SamplingParams(max_tokens=4096, thinking_token_budget=128).thinking_token_budget
+        == 128
+    )

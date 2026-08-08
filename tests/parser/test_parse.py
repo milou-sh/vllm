@@ -278,6 +278,23 @@ def test_parse_required_tool_choice(tokenizer):
     assert json.loads(tool_calls[1].arguments) == {"timezone": "UTC"}
 
 
+def test_parse_required_tool_choice_with_duplicated_array_prefix(tokenizer):
+    parser = make_parser(tokenizer, reasoning=False, tool=True)
+    functions_json = '[[{"name":"get_weather","parameters":{"city":"Dallas"}}]'
+    request = make_request(tools=TOOLS, tool_choice="required")
+
+    reasoning, content, tool_calls = parser.parse(
+        functions_json, request, enable_auto_tools=True
+    )
+
+    assert reasoning is None
+    assert content is None
+    assert tool_calls is not None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].name == "get_weather"
+    assert json.loads(tool_calls[0].arguments) == {"city": "Dallas"}
+
+
 def test_parse_required_tool_choice_kimi_k2_ids(tokenizer):
     parser = make_parser(
         tokenizer, reasoning=False, tool=True, model_config=KIMI_K2_MODEL_CONFIG

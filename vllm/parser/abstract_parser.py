@@ -461,11 +461,17 @@ class DelegatingParser(Parser):
         elif is_required_tool_choice and supports_required_and_named:
             # "required" with standard JSON-based parsing
             parsed_calls = []
-            with contextlib.suppress(ValidationError):
-                content = content or ""
-                parsed_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
-                    content
-                )
+            content = content or ""
+            adapter = TypeAdapter(list[FunctionDefinition])
+            try:
+                parsed_calls = adapter.validate_json(content)
+            except ValidationError:
+                stripped = content.lstrip()
+                if stripped.startswith("[["):
+                    prefix = content[: len(content) - len(stripped)]
+                    normalized = prefix + stripped[1:]
+                    with contextlib.suppress(ValidationError):
+                        parsed_calls = adapter.validate_json(normalized)
             for tc in parsed_calls:
                 tool_calls.append(
                     FunctionCall(
