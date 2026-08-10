@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+import vllm._custom_ops as ops
 from vllm.distributed import cleanup_dist_env_and_memory, get_tp_group
 from vllm.distributed.parallel_state import (
     graph_capture,
@@ -98,6 +99,74 @@ def _make_logits(args, num_rows: int, device: torch.device) -> torch.Tensor:
     return logits
 
 
+def _make_fp8_lm_head_runner(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_type: str,
+):
+    if weight_scale_type == "tensor":
+        weight_fp8, weight_scale = ops.scaled_fp8_quant(weight)
+    else:
+        weight_fp8, weight_scale = ops.scaled_fp8_quant(
+            weight, use_per_token_if_dynamic=True
+        )
+        weight_scale = weight_scale.t().contiguous()
+    weight_fp8 = weight_fp8.t().contiguous()
+
+    def run():
+        hidden_fp8, hidden_scale = ops.scaled_fp8_quant(
+            hidden_states, use_per_token_if_dynamic=True
+        )
+        return ops.cutlass_scaled_mm(
+            hidden_fp8,
+            weight_fp8,
+            hidden_scale,
+            weight_scale,
+            torch.bfloat16,
+        )
+
+    return run
+
+
+def _fp8_lm_head_quality(
+    reference_local: torch.Tensor,
+    candidate_local: torch.Tensor,
+    top_p: torch.Tensor,
+    tp_group,
+) -> dict[str, float]:
+    reference = tp_group.all_gather(reference_local, dim=-1).float()
+    candidate = tp_group.all_gather(candidate_local, dim=-1).float()
+    reference_log_probs = reference.log_softmax(dim=-1)
+    candidate_log_probs = candidate.log_softmax(dim=-1)
+    reference_probs = reference_log_probs.exp()
+    candidate_probs = candidate_log_probs.exp()
+    reference_keep = _stable_top_p_mask(reference, top_p)
+    candidate_keep = _stable_top_p_mask(candidate, top_p)
+    intersection = (reference_keep & candidate_keep).sum(dim=-1)
+    union = (reference_keep | candidate_keep).sum(dim=-1)
+    relative_l2 = (candidate - reference).norm(dim=-1) / reference.norm(dim=-1)
+    cosine = F.cosine_similarity(reference, candidate, dim=-1)
+    total_variation = 0.5 * (reference_probs - candidate_probs).abs().sum(dim=-1)
+    kl_divergence = (reference_probs * (reference_log_probs - candidate_log_probs)).sum(
+        dim=-1
+    )
+    return {
+        "argmax_agreement": float(
+            (reference.argmax(dim=-1) == candidate.argmax(dim=-1)).float().mean()
+        ),
+        "cosine_mean": float(cosine.mean()),
+        "kl_mean": float(kl_divergence.mean()),
+        "max_abs_error": float((candidate - reference).abs().amax()),
+        "relative_l2_mean": float(relative_l2.mean()),
+        "top_p_jaccard_mean": float((intersection / union).float().mean()),
+        "top_p_rows_exact_fraction": float(
+            (reference_keep == candidate_keep).all(dim=-1).float().mean()
+        ),
+        "total_variation_mean": float(total_variation.mean()),
+        "total_variation_max": float(total_variation.amax()),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-requests", type=int, default=10)
@@ -116,6 +185,7 @@ def main():
     parser.add_argument("--seed", type=int, default=20260810)
     parser.add_argument("--logits-file")
     parser.add_argument("--measure-lm-head", action="store_true")
+    parser.add_argument("--measure-fp8-lm-head", action="store_true")
     parser.add_argument("--measure-cudagraph", action="store_true")
     parser.add_argument("--require-output-equality", action="store_true")
     args = parser.parse_args()
@@ -299,24 +369,70 @@ def main():
         )
     lm_head_cuda_ms = None
     lm_head_wall_ms = None
-    if args.measure_lm_head:
+    lm_head_graph_cuda_ms = None
+    lm_head_graph_wall_ms = None
+    fp8_lm_head_results = None
+    if args.measure_lm_head or args.measure_fp8_lm_head:
+        torch.manual_seed(args.seed + 1000)
         hidden_states = torch.randn(
             num_rows,
             args.model_hidden_size,
             dtype=torch.bfloat16,
             device=device,
         )
+        torch.manual_seed(args.seed + 2000 + rank)
         lm_head_weight = torch.randn(
             local_vocab,
             args.model_hidden_size,
             dtype=torch.bfloat16,
             device=device,
-        )
+        ).mul_(args.model_hidden_size**-0.5)
         lm_head_cuda_ms, lm_head_wall_ms = _time_ms(
             lambda: F.linear(hidden_states, lm_head_weight),
             args.warmup,
             args.iterations,
         )
+        if args.measure_cudagraph:
+            lm_head_graph, _lm_head_graph_output = _capture_cuda_graph(
+                lambda: F.linear(hidden_states, lm_head_weight), device
+            )
+            lm_head_graph_cuda_ms, lm_head_graph_wall_ms = _time_ms(
+                lm_head_graph.replay,
+                args.warmup,
+                args.iterations,
+            )
+        if args.measure_fp8_lm_head:
+            reference_local = F.linear(hidden_states, lm_head_weight)
+            fp8_lm_head_results = {}
+            for weight_scale_type in ("tensor", "channel"):
+                runner = _make_fp8_lm_head_runner(
+                    hidden_states, lm_head_weight, weight_scale_type
+                )
+                candidate_local = runner()
+                cuda_ms, wall_ms = _time_ms(
+                    runner,
+                    args.warmup,
+                    args.iterations,
+                )
+                result = {
+                    "cuda_median_ms": statistics.median(cuda_ms),
+                    "wall_median_ms": statistics.median(wall_ms),
+                    "quality": _fp8_lm_head_quality(
+                        reference_local, candidate_local, top_p, tp_group
+                    ),
+                }
+                if args.measure_cudagraph:
+                    graph, _graph_output = _capture_cuda_graph(runner, device)
+                    graph_cuda_ms, graph_wall_ms = _time_ms(
+                        graph.replay,
+                        args.warmup,
+                        args.iterations,
+                    )
+                    result.update(
+                        graph_cuda_median_ms=statistics.median(graph_cuda_ms),
+                        graph_wall_median_ms=statistics.median(graph_wall_ms),
+                    )
+                fp8_lm_head_results[weight_scale_type] = result
     if rank == 0:
         distributed_cuda_median = statistics.median(distributed_cuda_ms)
         distributed_wall_median = statistics.median(distributed_wall_ms)
@@ -328,6 +444,27 @@ def main():
         lm_head_wall_median = (
             statistics.median(lm_head_wall_ms) if lm_head_wall_ms else None
         )
+        lm_head_graph_cuda_median = (
+            statistics.median(lm_head_graph_cuda_ms) if lm_head_graph_cuda_ms else None
+        )
+        lm_head_graph_wall_median = (
+            statistics.median(lm_head_graph_wall_ms) if lm_head_graph_wall_ms else None
+        )
+        if fp8_lm_head_results is not None:
+            for result in fp8_lm_head_results.values():
+                result["cuda_speedup_vs_bf16"] = (
+                    lm_head_cuda_median / result["cuda_median_ms"]
+                )
+                result["wall_speedup_vs_bf16"] = (
+                    lm_head_wall_median / result["wall_median_ms"]
+                )
+                if lm_head_graph_cuda_median is not None:
+                    result["graph_cuda_speedup_vs_bf16"] = (
+                        lm_head_graph_cuda_median / result["graph_cuda_median_ms"]
+                    )
+                    result["graph_wall_speedup_vs_bf16"] = (
+                        lm_head_graph_wall_median / result["graph_wall_median_ms"]
+                    )
         distributed_graph_cuda_median = (
             statistics.median(distributed_graph_cuda_ms)
             if distributed_graph_cuda_ms
@@ -386,6 +523,9 @@ def main():
                     "full_graph_wall_median_ms": full_graph_wall_median,
                     "lm_head_cuda_median_ms": lm_head_cuda_median,
                     "lm_head_wall_median_ms": lm_head_wall_median,
+                    "lm_head_graph_cuda_median_ms": lm_head_graph_cuda_median,
+                    "lm_head_graph_wall_median_ms": lm_head_graph_wall_median,
+                    "fp8_lm_head": fp8_lm_head_results,
                     "pipeline_cuda_speedup": (
                         (lm_head_cuda_median + full_cuda_median)
                         / (lm_head_cuda_median + distributed_cuda_median)
