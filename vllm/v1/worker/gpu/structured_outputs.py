@@ -5,18 +5,21 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
-from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+from vllm.v1.worker.gpu.buffer_utils import UvaBufferPool
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
 class StructuredOutputsWorker:
     def __init__(self, max_num_logits: int, vocab_size: int, device: torch.device):
+        bitmask_shape = (max_num_logits, cdiv(vocab_size, 32))
         self.logits_indices = torch.zeros(
             max_num_logits, dtype=torch.int32, device=device
         )
         self.grammar_bitmask = torch.zeros(
-            (max_num_logits, cdiv(vocab_size, 32)), dtype=torch.int32, device=device
+            bitmask_shape, dtype=torch.int32, device=device
         )
+        self.logits_indices_staging = UvaBufferPool(max_num_logits, torch.int32)
+        self.grammar_bitmask_staging = UvaBufferPool(bitmask_shape, torch.int32)
         self.device = device
         self.copy_stream = torch.cuda.Stream()
 
@@ -32,7 +35,7 @@ class StructuredOutputsWorker:
 
         # Asynchronously copy the bitmask to GPU.
         with torch.cuda.stream(self.copy_stream):
-            bitmask = async_copy_to_gpu(
+            bitmask = self.grammar_bitmask_staging.copy_to_gpu(
                 grammar_bitmask, out=self.grammar_bitmask[: grammar_bitmask.shape[0]]
             )
 
@@ -49,11 +52,9 @@ class StructuredOutputsWorker:
 
         # Asynchronously copy the mapping to GPU.
         with torch.cuda.stream(self.copy_stream):
-            logits_indices = torch.tensor(
-                mapping, dtype=torch.int32, device="cpu", pin_memory=True
-            )
-            logits_indices = self.logits_indices[: len(mapping)].copy_(
-                logits_indices, non_blocking=True
+            logits_indices = self.logits_indices_staging.copy_to_gpu(
+                np.asarray(mapping, dtype=np.int32),
+                out=self.logits_indices[: len(mapping)],
             )
 
         # Ensure all async copies are complete before launching the kernel.
