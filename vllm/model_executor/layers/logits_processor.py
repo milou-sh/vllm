@@ -71,15 +71,32 @@ class LogitsProcessor(PluggableLayer):
         else:
             # Get the logits for the next tokens.
             logits = self._get_logits(hidden_states, lm_head, embedding_bias)
-        if logits is not None:
-            if self.soft_cap is not None:
-                logits = logits / self.soft_cap
-                logits = torch.tanh(logits)
-                logits = logits * self.soft_cap
+        return self._process_logits(logits)
 
-            if self.scale != 1.0:
-                logits *= self.scale
+    def _process_logits(self, logits: torch.Tensor | None) -> torch.Tensor | None:
+        if logits is None:
+            return None
+        if self.soft_cap is not None:
+            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+        if self.scale != 1.0:
+            logits *= self.scale
         return logits
+
+    def get_local_logits(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, int]:
+        if self.logits_as_input:
+            raise ValueError("Local logits require a vocab-parallel lm_head.")
+        logits = self._apply_head(lm_head, hidden_states, embedding_bias)
+        processed = self._process_logits(logits)
+        assert processed is not None
+        num_pad = lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            processed[..., -num_pad:] = -float("inf")
+        return processed, lm_head.shard_indices.org_vocab_start_index
 
     def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """gather/all-gather the logits tensor across model parallel group."""

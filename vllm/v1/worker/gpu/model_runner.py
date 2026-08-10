@@ -1186,6 +1186,39 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
+        if (
+            envs.VLLM_GLM52_DISTRIBUTED_NUCLEUS
+            and input_batch.num_draft_tokens > 0
+            and self.lora_config is None
+            and self.rejection_sampler is not None
+            and self.speculator is not None
+            and hasattr(self.model, "compute_local_logits")
+            and self.rejection_sampler.can_vocab_parallel_nucleus(
+                input_batch, self.speculator.draft_logits
+            )
+        ):
+            local_logits, vocab_start = self.model.compute_local_logits(
+                sample_hidden_states
+            )
+            if local_logits.dtype == torch.bfloat16:
+                if grammar_output is not None:
+                    assert self.structured_outputs_worker is not None
+                    self.structured_outputs_worker.apply_grammar_bitmask(
+                        local_logits,
+                        input_batch,
+                        grammar_output.structured_output_request_ids,
+                        grammar_output.grammar_bitmask,
+                        vocab_start=vocab_start,
+                    )
+                sampler_output = self.rejection_sampler.vocab_parallel_nucleus(
+                    local_logits, vocab_start, input_batch
+                )
+                return (
+                    sampler_output,
+                    sampler_output.num_sampled,
+                    sampler_output.num_rejected,
+                )
+
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.

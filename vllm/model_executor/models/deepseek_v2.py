@@ -1962,4 +1962,7 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
-    pass
+    def compute_local_logits(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, int]:
+        return self.logits_processor.get_local_logits(self.lm_head, hidden_states)
