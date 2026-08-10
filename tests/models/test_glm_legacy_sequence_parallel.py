@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import pytest
 import torch
 from torch import nn
 
@@ -94,6 +95,86 @@ def test_legacy_glm_tp_only_sequence_parallel_is_opt_in(monkeypatch):
     monkeypatch.setattr(deepseek_v2.envs, "VLLM_GLM_LEGACY_TP_MOE_SP", True)
 
     assert parallel_config.use_sequence_parallel_moe
+
+
+@pytest.mark.parametrize(
+    ("enabled", "is_sequence_parallel", "tp_size", "expected"),
+    [
+        (True, True, 4, True),
+        (False, True, 4, False),
+        (True, False, 4, False),
+        (True, True, 1, False),
+        (True, True, 5, False),
+    ],
+)
+def test_legacy_glm_can_shard_sequence_parallel_mlp(
+    monkeypatch,
+    enabled: bool,
+    is_sequence_parallel: bool,
+    tp_size: int,
+    expected: bool,
+):
+    monkeypatch.setattr(
+        deepseek_v2.envs,
+        "VLLM_GLM_LEGACY_SHARD_SP_MLP",
+        enabled,
+    )
+    monkeypatch.setattr(
+        deepseek_v2,
+        "get_tensor_model_parallel_world_size",
+        lambda: tp_size,
+    )
+
+    assert (
+        deepseek_v2.shard_sequence_parallel_mlp(
+            hidden_size=6144,
+            intermediate_size=2048,
+            is_sequence_parallel=is_sequence_parallel,
+        )
+        is expected
+    )
+
+
+def test_sharded_sequence_parallel_mlp_matches_replicated():
+    tp_size, hidden, intermediate, tokens_per_rank = 4, 16, 12, 3
+    torch.manual_seed(0)
+    num_tokens = tp_size * tokens_per_rank
+    hidden_states = torch.randn(num_tokens, hidden)
+    gate_weight = torch.randn(intermediate, hidden)
+    up_weight = torch.randn(intermediate, hidden)
+    down_weight = torch.randn(hidden, intermediate)
+
+    def activate(states: torch.Tensor) -> torch.Tensor:
+        gate, up = states.chunk(2, dim=-1)
+        return torch.nn.functional.silu(gate) * up
+
+    replicated = (
+        activate(hidden_states @ torch.cat([gate_weight, up_weight]).T) @ down_weight.T
+    )
+    shard_size = intermediate // tp_size
+    partials = [
+        activate(
+            hidden_states
+            @ torch.cat(
+                [
+                    gate_weight[rank * shard_size : (rank + 1) * shard_size],
+                    up_weight[rank * shard_size : (rank + 1) * shard_size],
+                ]
+            ).T
+        )
+        @ down_weight[:, rank * shard_size : (rank + 1) * shard_size].T
+        for rank in range(tp_size)
+    ]
+    reduced = torch.stack(partials).sum(0)
+
+    for rank in range(tp_size):
+        token_slice = slice(rank * tokens_per_rank, (rank + 1) * tokens_per_rank)
+        torch.testing.assert_close(
+            reduced[token_slice],
+            replicated[token_slice],
+            atol=1e-5,
+            rtol=1e-5,
+        )
 
 
 def test_legacy_decoder_keeps_dense_states_sharded(monkeypatch):

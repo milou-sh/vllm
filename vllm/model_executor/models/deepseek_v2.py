@@ -238,6 +238,19 @@ class DeepseekAttention(nn.Module):
         return output
 
 
+def shard_sequence_parallel_mlp(
+    hidden_size: int,
+    intermediate_size: int,
+    is_sequence_parallel: bool,
+) -> bool:
+    if not (is_sequence_parallel and envs.VLLM_GLM_LEGACY_SHARD_SP_MLP):
+        return False
+    tp_size = get_tensor_model_parallel_world_size()
+    return (
+        tp_size > 1 and intermediate_size % tp_size == 0 and hidden_size % tp_size == 0
+    )
+
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -251,16 +264,19 @@ class DeepseekV2MLP(nn.Module):
     ) -> None:
         super().__init__()
 
-        # If is_sequence_parallel, the input and output tensors are sharded
-        # across the ranks within the tp_group. In this case the weights are
-        # replicated and no collective ops are needed.
-        # Otherwise we use standard TP with an allreduce at the end.
+        # SP either replicates weights or gathers tokens around TP-sharded projections.
+        self.shard_sequence_parallel = shard_sequence_parallel_mlp(
+            hidden_size,
+            intermediate_size,
+            is_sequence_parallel,
+        )
+        replicate = is_sequence_parallel and not self.shard_sequence_parallel
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            disable_tp=is_sequence_parallel,
+            disable_tp=replicate,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -268,8 +284,8 @@ class DeepseekV2MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=reduce_results,
-            disable_tp=is_sequence_parallel,
+            reduce_results=(False if self.shard_sequence_parallel else reduce_results),
+            disable_tp=replicate,
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
@@ -279,9 +295,13 @@ class DeepseekV2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        if self.shard_sequence_parallel:
+            x = sp_all_gather(x)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
+        if self.shard_sequence_parallel:
+            x = sp_reduce_scatter(x)
         return x
 
 
