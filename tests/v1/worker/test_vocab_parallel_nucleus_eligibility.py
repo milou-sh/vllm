@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
+from vllm import envs
 from vllm.v1.worker.gpu.sample.vocab_parallel_nucleus import (
     _gather_high_histogram,
     _gather_low_histogram,
 )
+from vllm.v1.worker.gpu.spec_decode import rejection_sampler as rejection_sampler_module
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
 
@@ -92,6 +96,41 @@ def test_unsupported_sampling_features_fall_back():
     sampler.sampler.bad_words_state.num_bad_words.np[0] = 0
 
     assert not sampler.can_vocab_parallel_nucleus(input_batch, draft_logits=object())
+
+
+def test_capture_schedule_saves_replayable_full_vocab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    sampler, _ = _make_sampler()
+    sampler._nucleus_capture_step = 0
+    sampler._nucleus_capture_count = 0
+    full_logits = torch.arange(24, dtype=torch.bfloat16).view(2, 12)
+    group = _FakeGroup([full_logits, full_logits])
+    monkeypatch.setattr(rejection_sampler_module, "get_tp_group", lambda: group)
+    monkeypatch.setattr(
+        envs, "VLLM_GLM52_NUCLEUS_CAPTURE_DIR", str(tmp_path), raising=False
+    )
+    monkeypatch.setattr(envs, "VLLM_GLM52_NUCLEUS_CAPTURE_EVERY", 2, raising=False)
+    monkeypatch.setattr(envs, "VLLM_GLM52_NUCLEUS_CAPTURE_LIMIT", 2, raising=False)
+    local_logits = full_logits[:, :6].contiguous()
+    top_p = torch.full((2,), 0.95)
+    positions = torch.tensor([131000, 131001])
+    cu_num_logits = torch.tensor([0, 2])
+
+    for _ in range(4):
+        sampler._capture_nucleus_logits(
+            local_logits, top_p, positions, cu_num_logits, vocab_size=10
+        )
+
+    captures = sorted(tmp_path.glob("*.pt"))
+    assert [path.name for path in captures] == [
+        "target-logits-000-step-00000000.pt",
+        "target-logits-001-step-00000002.pt",
+    ]
+    payload = torch.load(captures[1], weights_only=True)
+    torch.testing.assert_close(payload["logits"], full_logits[:, :10])
+    torch.testing.assert_close(payload["positions"], positions)
+    assert payload["step"] == 2
 
 
 def test_histogram_gathers_rebase_rank_local_mass():
