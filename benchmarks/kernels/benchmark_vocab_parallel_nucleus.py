@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import statistics
+import time
 
 import torch
 import torch.distributed as dist
@@ -23,21 +24,25 @@ from vllm.v1.worker.gpu.sample.vocab_parallel_nucleus import (
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
 
 
-def _time_ms(fn, warmup: int, iterations: int) -> list[float]:
+def _time_ms(fn, warmup: int, iterations: int) -> tuple[list[float], list[float]]:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
-    timings = []
+    cuda_timings = []
+    wall_timings = []
     for _ in range(iterations):
         dist.barrier()
+        torch.cuda.synchronize()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
+        wall_start = time.perf_counter()
         start.record()
         fn()
         end.record()
         end.synchronize()
-        timings.append(start.elapsed_time(end))
-    return timings
+        wall_timings.append((time.perf_counter() - wall_start) * 1000)
+        cuda_timings.append(start.elapsed_time(end))
+    return cuda_timings, wall_timings
 
 
 def main():
@@ -164,11 +169,15 @@ def main():
         distributed_output.sampled[valid], full_sampled[valid], rtol=0, atol=0
     )
 
-    distributed_ms = _time_ms(distributed_path, args.warmup, args.iterations)
-    full_ms = _time_ms(full_path, args.warmup, args.iterations)
+    distributed_cuda_ms, distributed_wall_ms = _time_ms(
+        distributed_path, args.warmup, args.iterations
+    )
+    full_cuda_ms, full_wall_ms = _time_ms(full_path, args.warmup, args.iterations)
     if rank == 0:
-        distributed_median = statistics.median(distributed_ms)
-        full_median = statistics.median(full_ms)
+        distributed_cuda_median = statistics.median(distributed_cuda_ms)
+        distributed_wall_median = statistics.median(distributed_wall_ms)
+        full_cuda_median = statistics.median(full_cuda_ms)
+        full_wall_median = statistics.median(full_wall_ms)
         print(
             json.dumps(
                 {
@@ -183,9 +192,12 @@ def main():
                     "flashinfer_backend": os.getenv(
                         "VLLM_FLASHINFER_ALLREDUCE_BACKEND", "auto"
                     ),
-                    "distributed_median_ms": distributed_median,
-                    "full_median_ms": full_median,
-                    "speedup": full_median / distributed_median,
+                    "distributed_cuda_median_ms": distributed_cuda_median,
+                    "distributed_wall_median_ms": distributed_wall_median,
+                    "full_cuda_median_ms": full_cuda_median,
+                    "full_wall_median_ms": full_wall_median,
+                    "cuda_speedup": full_cuda_median / distributed_cuda_median,
+                    "wall_speedup": full_wall_median / distributed_wall_median,
                     "outputs_equal": True,
                 },
                 sort_keys=True,
