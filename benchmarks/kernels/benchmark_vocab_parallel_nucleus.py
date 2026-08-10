@@ -9,6 +9,7 @@ import time
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from vllm.distributed import cleanup_dist_env_and_memory, get_tp_group
 from vllm.distributed.parallel_state import (
@@ -54,6 +55,7 @@ def main():
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument("--measure-lm-head", action="store_true")
     args = parser.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -173,11 +175,37 @@ def main():
         distributed_path, args.warmup, args.iterations
     )
     full_cuda_ms, full_wall_ms = _time_ms(full_path, args.warmup, args.iterations)
+    lm_head_cuda_ms = None
+    lm_head_wall_ms = None
+    if args.measure_lm_head:
+        hidden_states = torch.randn(
+            num_rows,
+            args.model_hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        lm_head_weight = torch.randn(
+            local_vocab,
+            args.model_hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        lm_head_cuda_ms, lm_head_wall_ms = _time_ms(
+            lambda: F.linear(hidden_states, lm_head_weight),
+            args.warmup,
+            args.iterations,
+        )
     if rank == 0:
         distributed_cuda_median = statistics.median(distributed_cuda_ms)
         distributed_wall_median = statistics.median(distributed_wall_ms)
         full_cuda_median = statistics.median(full_cuda_ms)
         full_wall_median = statistics.median(full_wall_ms)
+        lm_head_cuda_median = (
+            statistics.median(lm_head_cuda_ms) if lm_head_cuda_ms else None
+        )
+        lm_head_wall_median = (
+            statistics.median(lm_head_wall_ms) if lm_head_wall_ms else None
+        )
         print(
             json.dumps(
                 {
@@ -198,6 +226,20 @@ def main():
                     "full_wall_median_ms": full_wall_median,
                     "cuda_speedup": full_cuda_median / distributed_cuda_median,
                     "wall_speedup": full_wall_median / distributed_wall_median,
+                    "lm_head_cuda_median_ms": lm_head_cuda_median,
+                    "lm_head_wall_median_ms": lm_head_wall_median,
+                    "pipeline_cuda_speedup": (
+                        (lm_head_cuda_median + full_cuda_median)
+                        / (lm_head_cuda_median + distributed_cuda_median)
+                        if lm_head_cuda_median is not None
+                        else None
+                    ),
+                    "pipeline_wall_speedup": (
+                        (lm_head_wall_median + full_wall_median)
+                        / (lm_head_wall_median + distributed_wall_median)
+                        if lm_head_wall_median is not None
+                        else None
+                    ),
                     "outputs_equal": True,
                 },
                 sort_keys=True,
