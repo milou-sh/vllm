@@ -18,8 +18,6 @@ class TensorParallelGroup(Protocol):
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor: ...
 
-    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor: ...
-
 
 @dataclass(frozen=True)
 class NucleusCutoff:
@@ -33,6 +31,7 @@ class NucleusCutoff:
 class NucleusSamples:
     sampled: torch.Tensor
     sampled_without_excluded: torch.Tensor
+    excluded_logit: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -53,7 +52,7 @@ def _radix_high_histogram_kernel(
     logits_stride,
     histogram_ptr,
     histogram_stride,
-    global_max_ptr,
+    local_max_ptr,
     vocab_size,
     vocab_start,
     org_vocab_size,
@@ -69,7 +68,7 @@ def _radix_high_histogram_kernel(
         other=-float("inf"),
     )
     keys = _ordered_bf16_key(logits)
-    weights = tl.exp(logits.to(tl.float32) - tl.load(global_max_ptr + row))
+    weights = tl.exp(logits.to(tl.float32) - tl.load(local_max_ptr + row))
     tl.atomic_add(
         histogram_ptr + row * histogram_stride + (keys >> 8),
         weights,
@@ -107,7 +106,7 @@ def _radix_low_histogram_kernel(
     logits_stride,
     histogram_ptr,
     histogram_stride,
-    global_max_ptr,
+    local_max_ptr,
     high_key_ptr,
     vocab_size,
     vocab_start,
@@ -126,7 +125,7 @@ def _radix_low_histogram_kernel(
     )
     keys = _ordered_bf16_key(logits)
     mask &= (keys >> 8) == tl.load(high_key_ptr + row)
-    weights = tl.exp(logits.to(tl.float32) - tl.load(global_max_ptr + row))
+    weights = tl.exp(logits.to(tl.float32) - tl.load(local_max_ptr + row))
     tl.atomic_add(
         histogram_ptr + row * histogram_stride + (keys & 0xFF),
         weights,
@@ -395,21 +394,48 @@ def _one_hot_rejection_kernel(
         tl.store(num_sampled_ptr + req_idx, accepted + 1)
 
 
-def _global_row_max(
-    local_logits: torch.Tensor,
+def _gather_high_histogram(
+    local_histogram: torch.Tensor,
+    local_max: torch.Tensor,
     tp_group: TensorParallelGroup | None,
-) -> torch.Tensor:
-    local_max = local_logits.amax(dim=-1).float()
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if tp_group is None or tp_group.world_size == 1:
-        return local_max
-    gathered = tp_group.all_gather(local_max, dim=0)
-    return gathered.view(tp_group.world_size, local_logits.shape[0]).amax(dim=0)
+        return local_histogram, local_max, local_max.unsqueeze(0)
+    num_rows = local_histogram.shape[0]
+    packed = torch.cat((local_max.unsqueeze(-1), local_histogram), dim=-1)
+    gathered = tp_group.all_gather(packed, dim=0).view(
+        tp_group.world_size, num_rows, packed.shape[-1]
+    )
+    rank_max = gathered[:, :, 0]
+    global_max = rank_max.amax(dim=0)
+    scale = torch.exp(rank_max - global_max.unsqueeze(0)).unsqueeze(-1)
+    histogram = (gathered[:, :, 1:] * scale).sum(dim=0)
+    return histogram, global_max, rank_max
+
+
+def _gather_low_histogram(
+    local_histogram: torch.Tensor,
+    rank_max: torch.Tensor,
+    global_max: torch.Tensor,
+    tp_group: TensorParallelGroup | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if tp_group is None or tp_group.world_size == 1:
+        rank_histogram = local_histogram.unsqueeze(0)
+    else:
+        rank_histogram = tp_group.all_gather(local_histogram, dim=0).view(
+            tp_group.world_size, local_histogram.shape[0], local_histogram.shape[1]
+        )
+    scale = torch.exp(rank_max - global_max.unsqueeze(0)).unsqueeze(-1)
+    mass = (rank_histogram[:, :, :_NUM_RADIX_BINS] * scale).sum(dim=0)
+    counts = rank_histogram[:, :, _NUM_RADIX_BINS:].sum(dim=0)
+    return torch.cat((mass, counts), dim=-1), rank_histogram
 
 
 def _last_cutoff_token(
     local_logits: torch.Tensor,
     cutoff: torch.Tensor,
     keep_count: torch.Tensor,
+    rank_counts: torch.Tensor,
     *,
     vocab_start: int,
     org_vocab_size: int,
@@ -432,15 +458,7 @@ def _last_cutoff_token(
         org_vocab_size,
         BLOCK_SIZE=block_size,
     )
-    local_count = block_counts.sum(dim=-1)
-    if tp_group is None or tp_group.world_size == 1:
-        rank_counts = local_count.unsqueeze(0)
-        rank = 0
-    else:
-        rank_counts = tp_group.all_gather(local_count, dim=0).view(
-            tp_group.world_size, num_rows
-        )
-        rank = tp_group.rank_in_group
+    rank = 0 if tp_group is None or tp_group.world_size == 1 else tp_group.rank_in_group
     rank_prefix = rank_counts.cumsum(dim=0)
     owner = (rank_prefix >= keep_count.unsqueeze(0)).to(torch.int32).argmax(dim=0)
     owner_before_idx = (owner - 1).clamp_min(0).unsqueeze(0)
@@ -496,7 +514,7 @@ def distributed_bf16_top_p_cutoff(
         raise ValueError("top_p must contain one value per logits row.")
 
     num_rows, local_vocab_size = local_logits.shape
-    global_max = _global_row_max(local_logits, tp_group)
+    local_max = local_logits.amax(dim=-1).float()
     histogram = torch.zeros(
         (num_rows, _NUM_RADIX_BINS), dtype=torch.float32, device=local_logits.device
     )
@@ -507,14 +525,15 @@ def distributed_bf16_top_p_cutoff(
         local_logits.stride(0),
         histogram,
         histogram.stride(0),
-        global_max,
+        local_max,
         local_vocab_size,
         vocab_start,
         org_vocab_size,
         BLOCK_SIZE=block_size,
     )
-    if tp_group is not None and tp_group.world_size > 1:
-        histogram = tp_group.all_reduce(histogram)
+    histogram, global_max, rank_max = _gather_high_histogram(
+        histogram, local_max, tp_group
+    )
 
     high_key = torch.empty(num_rows, dtype=torch.int32, device=local_logits.device)
     mass_above = torch.empty(num_rows, dtype=torch.float32, device=local_logits.device)
@@ -540,7 +559,7 @@ def distributed_bf16_top_p_cutoff(
         local_logits.stride(0),
         histogram,
         histogram.stride(0),
-        global_max,
+        local_max,
         high_key,
         local_vocab_size,
         vocab_start,
@@ -548,8 +567,9 @@ def distributed_bf16_top_p_cutoff(
         BLOCK_SIZE=block_size,
         NUM_BINS=_NUM_RADIX_BINS,
     )
-    if tp_group is not None and tp_group.world_size > 1:
-        histogram = tp_group.all_reduce(histogram)
+    histogram, rank_histogram = _gather_low_histogram(
+        histogram, rank_max, global_max, tp_group
+    )
 
     cutoff = torch.empty_like(high_key)
     cutoff_keep_count = torch.empty_like(high_key)
@@ -567,10 +587,21 @@ def distributed_bf16_top_p_cutoff(
         NUM_BINS=_NUM_RADIX_BINS,
         num_warps=8,
     )
+    low_key = (cutoff & 0xFF).long()
+    rank_counts = (
+        rank_histogram[:, :, _NUM_RADIX_BINS:]
+        .gather(
+            2,
+            low_key.view(1, num_rows, 1).expand(rank_histogram.shape[0], -1, -1),
+        )
+        .squeeze(-1)
+        .to(torch.int32)
+    )
     last_token = _last_cutoff_token(
         local_logits,
         cutoff,
         cutoff_keep_count,
+        rank_counts,
         vocab_start=vocab_start,
         org_vocab_size=org_vocab_size,
         tp_group=tp_group,
@@ -639,21 +670,42 @@ def distributed_nucleus_candidates(
     excluded_value, excluded_token = _reduce_local_candidates(
         excluded_values, excluded_candidates
     )
+    local_excluded_logits = torch.empty(
+        num_rows, dtype=torch.float32, device=local_logits.device
+    )
+    _lookup_local_excluded_logits_kernel[(num_rows,)](
+        local_logits,
+        local_logits.stride(0),
+        cutoff,
+        last_cutoff_token,
+        excluded_tokens,
+        local_excluded_logits,
+        local_vocab_size,
+        vocab_start,
+    )
 
     if tp_group is None or tp_group.world_size == 1:
-        return NucleusSamples(token, excluded_token)
+        return NucleusSamples(token, excluded_token, local_excluded_logits)
 
     packed = torch.stack(
-        (value, token.float(), excluded_value, excluded_token.float()), dim=-1
+        (
+            value,
+            token.float(),
+            excluded_value,
+            excluded_token.float(),
+            local_excluded_logits,
+        ),
+        dim=-1,
     )
-    gathered = tp_group.all_gather(packed, dim=0).view(tp_group.world_size, num_rows, 4)
+    gathered = tp_group.all_gather(packed, dim=0).view(tp_group.world_size, num_rows, 5)
     best_rank = gathered[:, :, 0].argmax(dim=0, keepdim=True)
     sampled = gathered[:, :, 1].gather(0, best_rank).squeeze(0).long()
     best_excluded_rank = gathered[:, :, 2].argmax(dim=0, keepdim=True)
     sampled_without_excluded = (
         gathered[:, :, 3].gather(0, best_excluded_rank).squeeze(0).long()
     )
-    return NucleusSamples(sampled, sampled_without_excluded)
+    excluded_logits = gathered[:, :, 4].amax(dim=0)
+    return NucleusSamples(sampled, sampled_without_excluded, excluded_logits)
 
 
 def distributed_one_hot_rejection_sample(
@@ -693,25 +745,9 @@ def distributed_one_hot_rejection_sample(
         tp_group=tp_group,
     )
 
-    local_draft_logits = torch.empty(
-        num_rows, dtype=torch.float32, device=local_logits.device
+    draft_probs = (
+        torch.exp(candidates.excluded_logit - cutoff.global_max) / cutoff.retained_mass
     )
-    _lookup_local_excluded_logits_kernel[(num_rows,)](
-        local_logits,
-        local_logits.stride(0),
-        cutoff.ordered_key,
-        cutoff.last_token_id,
-        excluded,
-        local_draft_logits,
-        local_logits.shape[1],
-        vocab_start,
-    )
-    if tp_group is not None and tp_group.world_size > 1:
-        gathered = tp_group.all_gather(local_draft_logits, dim=0)
-        draft_logits = gathered.view(tp_group.world_size, num_rows).amax(dim=0)
-    else:
-        draft_logits = local_draft_logits
-    draft_probs = torch.exp(draft_logits - cutoff.global_max) / cutoff.retained_mass
 
     sampled = torch.full(
         (num_reqs, num_speculative_steps + 1),

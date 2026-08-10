@@ -4,8 +4,25 @@
 from types import SimpleNamespace
 
 import numpy as np
+import torch
 
+from vllm.v1.worker.gpu.sample.vocab_parallel_nucleus import (
+    _gather_high_histogram,
+    _gather_low_histogram,
+)
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+
+
+class _FakeGroup:
+    world_size = 2
+    rank_in_group = 0
+
+    def __init__(self, outputs: list[torch.Tensor]):
+        self.outputs = iter(outputs)
+
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        del input_, dim
+        return next(self.outputs)
 
 
 def _make_sampler() -> tuple[RejectionSampler, SimpleNamespace]:
@@ -75,3 +92,36 @@ def test_unsupported_sampling_features_fall_back():
     sampler.sampler.bad_words_state.num_bad_words.np[0] = 0
 
     assert not sampler.can_vocab_parallel_nucleus(input_batch, draft_logits=object())
+
+
+def test_histogram_gathers_rebase_rank_local_mass():
+    rank_max = torch.tensor([[2.0, 4.0], [1.0, 3.0]])
+    high = torch.zeros(2, 2, 256)
+    high[0, :, 7] = torch.tensor([3.0, 5.0])
+    high[1, :, 7] = torch.tensor([11.0, 13.0])
+    high_packed = torch.cat((rank_max.unsqueeze(-1), high), dim=-1)
+    group = _FakeGroup([high_packed.flatten(0, 1)])
+
+    gathered_high, global_max, gathered_rank_max = _gather_high_histogram(
+        high[0], rank_max[0], group
+    )
+    expected_scale = torch.exp(rank_max - rank_max.amax(dim=0).unsqueeze(0))
+    expected_high = (high * expected_scale.unsqueeze(-1)).sum(dim=0)
+    torch.testing.assert_close(global_max, torch.tensor([2.0, 4.0]))
+    torch.testing.assert_close(gathered_rank_max, rank_max)
+    torch.testing.assert_close(gathered_high, expected_high)
+
+    low = torch.zeros(2, 2, 512)
+    low[0, :, 9] = torch.tensor([17.0, 19.0])
+    low[1, :, 9] = torch.tensor([23.0, 29.0])
+    low[0, :, 256 + 9] = torch.tensor([2.0, 3.0])
+    low[1, :, 256 + 9] = torch.tensor([5.0, 7.0])
+    group = _FakeGroup([low.flatten(0, 1)])
+    gathered_low, rank_low = _gather_low_histogram(
+        low[0], gathered_rank_max, global_max, group
+    )
+    expected_mass = (low[:, :, :256] * expected_scale.unsqueeze(-1)).sum(dim=0)
+    expected_counts = low[:, :, 256:].sum(dim=0)
+    torch.testing.assert_close(rank_low, low)
+    torch.testing.assert_close(gathered_low[:, :256], expected_mass)
+    torch.testing.assert_close(gathered_low[:, 256:], expected_counts)
