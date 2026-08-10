@@ -28,6 +28,9 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from vllm.models.common.ops.fused_allreduce_rms_norm import (
+    fused_allreduce_rms_norm,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -123,15 +126,21 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             hidden_states=hidden_states,
             residual=None,
         )
-        hidden_states = residual + hidden_states  # pre-final-norm (logits hidden)
-        if self.mtp_block.use_sequence_parallel_moe:
-            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-            hidden_states = hidden_states[: positions.shape[0]]
+        if self.mtp_block.fuse_attention_allreduce_rms:
+            normalized_hidden_states, hidden_states = fused_allreduce_rms_norm(
+                hidden_states, residual, self.shared_head.norm
+            )
+        else:
+            hidden_states = residual + hidden_states  # pre-final-norm (logits hidden)
+            if self.mtp_block.use_sequence_parallel_moe:
+                hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+                hidden_states = hidden_states[: positions.shape[0]]
+            normalized_hidden_states = self.shared_head(hidden_states)
         # Recycle the post-final-norm hidden into the next draft step.
         # compute_logits applies shared_head (== final norm) to the pre-norm
         # element, so logits and the recycle each get exactly one final-norm.
         # Matches SGLang's deepseek_nextn.
-        return hidden_states, self.shared_head(hidden_states)
+        return hidden_states, normalized_hidden_states
 
 
 class DeepSeekMultiTokenPredictor(nn.Module):
@@ -539,3 +548,19 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # treat shared weights as top level weights
             name = name.replace(f"model.layers.{spec_layer}.", "model.")
         return name
+
+
+class GlmMoeDsaMTP(DeepSeekMTP):
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        current_step_idx = spec_step_idx % self.model.num_mtp_layers
+        mtp_layer = self.model.layers[
+            str(self.model.mtp_start_layer_idx + current_step_idx)
+        ]
+        return self.model.logits_processor.get_top_tokens(
+            mtp_layer.shared_head.head,
+            mtp_layer.shared_head(hidden_states),
+        )
