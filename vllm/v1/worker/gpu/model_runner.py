@@ -127,6 +127,9 @@ from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
+from vllm.v1.worker.gpu.spec_decode.rejection_sample_cudagraph_utils import (
+    RejectionSamplerCudaGraphManager,
+)
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
@@ -275,6 +278,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
         self.sampler: Sampler | None = None
         self.rejection_sampler: RejectionSampler | None = None
+        self.rejection_sampler_cudagraph_manager: (
+            RejectionSamplerCudaGraphManager | None
+        ) = None
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
@@ -539,6 +545,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
         )
+        if (
+            envs.VLLM_GLM_TARGET_SAMPLER_GRAPH
+            and self.is_last_pp_rank
+            and self.model_config.hf_config.model_type == "glm_moe_dsa"
+            and self.rejection_sampler is not None
+            and self.speculator is not None
+            and self.lora_config is None
+        ):
+            self.rejection_sampler_cudagraph_manager = RejectionSamplerCudaGraphManager(
+                self.vllm_config,
+                self.device,
+                self.max_num_reqs,
+                self.num_speculative_steps,
+            )
         check_attention_cp_compatibility(self.vllm_config)
         if isinstance(self.speculator, DraftModelSpeculator):
             # HACK(woosuk)
@@ -821,6 +841,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             if self.speculator is not None:
                 self.speculator.capture()
+            self.capture_rejection_sampler()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
@@ -833,6 +854,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cuda_graph_size / (1 << 30),
         )
         return cuda_graph_size
+
+    def capture_rejection_sampler(self) -> None:
+        if self.rejection_sampler_cudagraph_manager is None:
+            return
+
+        assert self.rejection_sampler is not None
+        assert self.speculator is not None
+        assert self.cudagraph_manager is not None
+
+        hidden_states = self.cudagraph_manager.hidden_states
+        if hidden_states is None:
+            # No FULL model capture happened (e.g., PIECEWISE-only mode);
+            # we have nothing to chain onto.
+            return
+
+        self.rejection_sampler_cudagraph_manager.capture(
+            descs=list(self.cudagraph_manager.graphs),
+            compute_logits_fn=self.model.compute_logits,
+            hidden_states=hidden_states,
+            rejection_sampler=self.rejection_sampler,
+            draft_logits=self.speculator.draft_logits,
+            input_buffers=self.input_buffers,
+            req_states=self.req_states,
+        )
 
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
@@ -1184,7 +1229,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
+        batch_desc: BatchExecutionDescriptor,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        manager = self.rejection_sampler_cudagraph_manager
+        if manager is not None and manager.can_run(
+            batch_desc, input_batch, grammar_output is not None
+        ):
+            return manager.run(batch_desc, input_batch)
+
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
@@ -1501,6 +1553,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         finished_req_ids = scheduler_output.finished_req_ids
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
+            batch_desc=batch_desc,
             attn_metadata=attn_metadata,
             slot_mappings_by_layer=slot_mappings_by_layer,
             hidden_states=hidden_states,
@@ -1524,6 +1577,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return None
 
         input_batch = self.execute_model_state.input_batch
+        batch_desc = self.execute_model_state.batch_desc
         attn_metadata = self.execute_model_state.attn_metadata
         slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
         hidden_states = self.execute_model_state.hidden_states
@@ -1556,7 +1610,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
+            hidden_states, input_batch, grammar_output, batch_desc
         )
 
         if self.pp_handler is not None:
@@ -1776,6 +1830,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
 class ExecuteModelState(NamedTuple):
     input_batch: InputBatch
+    batch_desc: BatchExecutionDescriptor
     attn_metadata: dict[str, Any] | None
     slot_mappings_by_layer: dict[str, torch.Tensor] | None
     hidden_states: torch.Tensor | None
