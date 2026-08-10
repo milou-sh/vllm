@@ -7,6 +7,7 @@ import torch
 
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
+from vllm.distributed import get_tp_group
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
@@ -19,6 +20,10 @@ from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+from vllm.v1.worker.gpu.sample.vocab_parallel_nucleus import (
+    distributed_bf16_top_p_cutoff,
+    distributed_one_hot_rejection_sample,
+)
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
@@ -90,6 +95,99 @@ class RejectionSampler:
             )
         elif rejection_sample_method == "block":
             self.use_block_verification = True
+
+    def can_vocab_parallel_nucleus(
+        self,
+        input_batch: InputBatch,
+        draft_logits: torch.Tensor | None,
+    ) -> bool:
+        if (
+            draft_logits is not None
+            or self.use_block_verification
+            or self.synthetic_conditional_rates is not None
+            or self.sampler.use_fp64_gumbel
+            or self.sampler.compute_nans
+        ):
+            return False
+        idx = input_batch.idx_mapping_np
+        states = self.sampler.sampling_states
+        if states.max_num_logprobs(idx) != NO_LOGPROBS:
+            return False
+        if self.sampler.logprob_token_ids_state.max_num_token_ids(idx) > 0:
+            return False
+        if not np.all(states.temperature.np[idx] == 1.0):
+            return False
+        top_p = states.top_p.np[idx]
+        if not np.all((top_p > 0.0) & (top_p < 1.0)):
+            return False
+        if not np.all(states.top_k.np[idx] == states.vocab_size):
+            return False
+        if not np.all(states.min_p.np[idx] == 0.0):
+            return False
+        if np.any(self.sampler.logit_bias_state.use_logit_bias[idx]):
+            return False
+        if np.any(self.sampler.penalties_state.use_penalty[idx]):
+            return False
+        return not np.any(self.sampler.bad_words_state.num_bad_words.np[idx] > 0)
+
+    def vocab_parallel_nucleus(
+        self,
+        local_logits: torch.Tensor,
+        vocab_start: int,
+        input_batch: InputBatch,
+    ) -> SamplerOutput:
+        if local_logits.dtype != torch.bfloat16:
+            raise ValueError("Distributed nucleus sampling requires BF16 logits.")
+
+        draft_sampled = input_batch.input_ids[input_batch.logits_indices]
+        pos = input_batch.positions[input_batch.logits_indices]
+        self.sampler.thinking_budget_state.apply(
+            local_logits,
+            input_batch.expanded_idx_mapping,
+            input_batch.idx_mapping,
+            input_batch.idx_mapping_np,
+            draft_sampled,
+            input_batch.expanded_local_pos,
+            vocab_start=vocab_start,
+        )
+        states = self.sampler.sampling_states
+        top_p = states.top_p.gpu[input_batch.expanded_idx_mapping]
+        tp_group = get_tp_group()
+        cutoff = distributed_bf16_top_p_cutoff(
+            local_logits,
+            top_p,
+            vocab_start=vocab_start,
+            org_vocab_size=states.vocab_size,
+            tp_group=tp_group,
+        )
+        output = distributed_one_hot_rejection_sample(
+            local_logits,
+            cutoff,
+            draft_sampled,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            input_batch.expanded_idx_mapping,
+            states.seeds.gpu,
+            pos,
+            self.num_speculative_steps,
+            vocab_start=vocab_start,
+            org_vocab_size=states.vocab_size,
+            tp_group=tp_group,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            output.num_sampled,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=output.sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
 
     def _get_logprobs_tensors(
         self,
