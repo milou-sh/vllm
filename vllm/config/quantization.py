@@ -82,7 +82,7 @@ class QuantizationConfigArgs:
     """User-facing quantization configuration.
 
     See `docs/features/quantization/online.md` for the schema and shorthand
-    string forms accepted on `linear` and `moe`.
+    string forms accepted on `linear`, `moe`, and `lm_head`.
     """
 
     linear: QuantSpec | None = None
@@ -91,10 +91,13 @@ class QuantizationConfigArgs:
     moe: QuantSpec | None = None
     """Spec applied to ``FusedMoEFactory`` layers."""
 
+    lm_head: QuantSpec | None = None
+    """Spec applied to an untied ``ParallelLMHead``."""
+
     ignore: list[str] = Field(default_factory=list)
     """Layers to skip quantization for."""
 
-    @field_validator("linear", "moe", mode="before")
+    @field_validator("linear", "moe", "lm_head", mode="before")
     @classmethod
     def _coerce_spec(cls, v: Any, info: ValidationInfo) -> Any:
         if not isinstance(v, str):
@@ -102,7 +105,8 @@ class QuantizationConfigArgs:
         field_name = info.field_name
         assert field_name is not None
         if v in _ONLINE_SHORTHANDS:
-            spec = getattr(_ONLINE_SHORTHANDS[v], field_name)
+            shorthand_field = "linear" if field_name == "lm_head" else field_name
+            spec = getattr(_ONLINE_SHORTHANDS[v], shorthand_field)
             if spec is None:
                 raise ValueError(
                     f"online shorthand {v!r} does not define a {field_name} spec"
@@ -190,5 +194,6 @@ def resolve_quantization_config(
     return QuantizationConfigArgs(
         linear=quantization_config.linear or base.linear,
         moe=quantization_config.moe or base.moe,
+        lm_head=quantization_config.lm_head or base.lm_head,
         ignore=quantization_config.ignore or base.ignore,
     )

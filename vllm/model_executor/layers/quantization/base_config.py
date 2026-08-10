@@ -11,6 +11,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 if TYPE_CHECKING:
+    from vllm.config.quantization import QuantizationConfigArgs
     from vllm.model_executor.layers.quantization import QuantizationMethods
     from vllm.model_executor.models.utils import WeightsMapper
 else:
@@ -238,6 +239,12 @@ class QuantizationConfig(ABC):
                 structure of the qconfig) to vllm model structure
         """
         # TODO (@kylesayrs): add implementations for all subclasses
+        pass
+
+    def apply_user_quantization_config(  # noqa: B027
+        self, args: "QuantizationConfigArgs"
+    ) -> None:
+        """Apply online overrides on top of checkpoint quantization."""
         pass
 
     def maybe_update_config(  # noqa: B027

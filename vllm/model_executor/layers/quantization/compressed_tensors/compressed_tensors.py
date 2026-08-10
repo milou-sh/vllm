@@ -14,6 +14,7 @@ from compressed_tensors.quantization import (
 from compressed_tensors.transform import TransformConfig
 
 from vllm.config import get_current_vllm_config_or_none
+from vllm.config.quantization import QuantizationConfigArgs
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -105,6 +106,18 @@ class CompressedTensorsConfig(QuantizationConfig):
             self.transform_config = TransformConfig.model_validate(transform_config)
         else:
             self.transform_config = None
+        self.online_lm_head: QuantizationConfig | None = None
+
+    def apply_user_quantization_config(self, args: QuantizationConfigArgs) -> None:
+        if args.lm_head is None:
+            return
+        from vllm.model_executor.layers.quantization.online.base import (
+            OnlineQuantizationConfig,
+        )
+
+        self.online_lm_head = OnlineQuantizationConfig(
+            QuantizationConfigArgs(lm_head=args.lm_head, ignore=args.ignore)
+        )
 
     def get_linear_method(self) -> "CompressedTensorsLinearMethod":
         return CompressedTensorsLinearMethod(self)
@@ -183,8 +196,15 @@ class CompressedTensorsConfig(QuantizationConfig):
             except ValueError:
                 quant_scheme = None
             if quant_scheme is not None:
+                if self.online_lm_head is not None:
+                    raise ValueError(
+                        "lm_head has checkpoint quantization and cannot also use "
+                        "an online lm_head override"
+                    )
                 layer.scheme = quant_scheme
                 return CompressedTensorsLinearMethod(self)
+            if self.online_lm_head is not None:
+                return self.online_lm_head.get_quant_method(layer, prefix)
 
         # ParallelLMHead subclasses VocabParallelEmbedding but is handled above as
         # a linear; only true embedding lookups land here.

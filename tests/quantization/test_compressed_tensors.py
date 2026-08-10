@@ -18,6 +18,7 @@ from compressed_tensors.quantization import (
 )
 
 from tests.models.utils import check_logprobs_close
+from vllm.config.quantization import QuantizationConfigArgs
 from vllm.model_executor.kernels.linear import (
     Fp8BlockScaledMMLinearKernel,
 )
@@ -658,6 +659,37 @@ def test_get_quant_method_returns_none_for_unmatched_parallel_lm_head():
     assert method is None, (
         f"Expected None for unmatched ParallelLMHead, got {type(method).__name__}"
     )
+
+
+def test_online_override_quantizes_unmatched_parallel_lm_head():
+    config = _make_ct_config(target="Linear")
+    config.apply_user_quantization_config(
+        QuantizationConfigArgs(lm_head="fp8_per_channel")
+    )
+    assert config.online_lm_head is not None
+    expected = Mock()
+    config.online_lm_head.get_quant_method = Mock(return_value=expected)
+    mock_lm_head = Mock(spec=ParallelLMHead)
+    mock_lm_head.__class__ = ParallelLMHead
+
+    method = config.get_quant_method(mock_lm_head, prefix="lm_head")
+
+    assert method is expected
+    config.online_lm_head.get_quant_method.assert_called_once_with(
+        mock_lm_head, "lm_head"
+    )
+
+
+def test_online_override_rejects_checkpoint_quantized_lm_head():
+    config = _make_ct_config(target="re:.*lm_head")
+    config.apply_user_quantization_config(
+        QuantizationConfigArgs(lm_head="fp8_per_channel")
+    )
+    mock_lm_head = Mock(spec=ParallelLMHead)
+    mock_lm_head.__class__ = ParallelLMHead
+
+    with pytest.raises(ValueError, match="checkpoint quantization"):
+        config.get_quant_method(mock_lm_head, prefix="model.lm_head")
 
 
 def test_find_matched_target_returns_none_on_no_match():

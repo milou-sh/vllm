@@ -14,6 +14,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic128Sym,
     kFp8DynamicTokenSym,
     kFp8Static128BlockSym,
+    kFp8StaticChannelSym,
     kFp8StaticTensorSym,
     kInt8StaticChannelSym,
     kMxfp8Dynamic,
@@ -56,6 +57,11 @@ def test_args_moe_string_resolves_via_online_shorthand():
     # would).
     args = QuantizationConfigArgs(moe="fp8_per_block")
     assert args.moe == QuantSpec(weight=kFp8Static128BlockSym)
+
+
+def test_args_lm_head_string_uses_linear_shorthand():
+    args = QuantizationConfigArgs(lm_head="fp8_per_channel")
+    assert args.lm_head == QuantSpec(weight=kFp8StaticChannelSym)
 
 
 def test_args_string_shorthand_missing_slot_raises():
@@ -104,6 +110,7 @@ def test_resolve_merges_explicit_over_shorthand():
     )
     assert args.linear == QuantSpec(weight=kFp8Static128BlockSym)
     assert args.moe == QuantSpec(weight=kFp8StaticTensorSym)
+    assert args.lm_head is None
 
 
 def test_resolve_rejects_quantization_config_with_non_shorthand_quant():

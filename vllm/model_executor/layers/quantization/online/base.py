@@ -57,6 +57,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Dynamic,
     kNvfp4Static,
 )
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 logger = init_logger(__name__)
 
@@ -92,11 +93,11 @@ class OnlineQuantizationConfig(QuantizationConfig):
         args: QuantizationConfigArgs,
     ) -> None:
         super().__init__()
-        if args.linear is None and args.moe is None:
+        if args.linear is None and args.moe is None and args.lm_head is None:
             raise ValueError(
                 "OnlineQuantizationConfig requires at least one of "
-                "quantization_config.linear or quantization_config.moe "
-                "to be set."
+                "quantization_config.linear, quantization_config.moe, or "
+                "quantization_config.lm_head to be set."
             )
         self.args = args
         self.ignored_layers: list[str] = args.ignore
@@ -157,7 +158,15 @@ class OnlineQuantizationConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
-        if isinstance(layer, LinearBase):
+        if isinstance(layer, ParallelLMHead):
+            if should_ignore_layer(
+                prefix,
+                ignore=self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                return None
+            return self._dispatch(self.args.lm_head, _ONLINE_LINEAR_METHODS, layer)
+        elif isinstance(layer, LinearBase):
             if should_ignore_layer(
                 prefix,
                 ignore=self.ignored_layers,
