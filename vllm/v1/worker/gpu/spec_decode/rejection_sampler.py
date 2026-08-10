@@ -8,6 +8,7 @@ import torch
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.triton_utils import tl, triton
+from vllm.utils.flashinfer import get_flashinfer_top_p_renorm_probs
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 from vllm.v1.worker.gpu.input_batch import (
@@ -90,6 +91,9 @@ class RejectionSampler:
             )
         elif rejection_sample_method == "block":
             self.use_block_verification = True
+        self.flashinfer_top_p_renorm_probs = (
+            get_flashinfer_top_p_renorm_probs() if sampler.use_flashinfer else None
+        )
 
     def _get_logprobs_tensors(
         self,
@@ -137,6 +141,7 @@ class RejectionSampler:
         idx_mapping_np: np.ndarray,
         expanded_idx_mapping: torch.Tensor,
         expanded_local_pos: torch.Tensor,
+        return_logprobs: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         processed_logits = self.sampler.apply_sampling_params(
             logits,
@@ -146,7 +151,41 @@ class RejectionSampler:
             pos,
             draft_sampled,
             expanded_local_pos,
+            skip_top_k_top_p=True,
         )
+        top_k, top_p = self.sampler.sampling_states.get_top_k_top_p(
+            expanded_idx_mapping,
+            idx_mapping_np,
+        )
+        top_p_renorm_probs = self.flashinfer_top_p_renorm_probs
+        use_flashinfer_top_p = (
+            draft_logits is None
+            and not self.use_block_verification
+            and top_k is None
+            and top_p is not None
+            and top_p_renorm_probs is not None
+            and self.sampler.will_use_flashinfer(
+                top_k,
+                top_p,
+                idx_mapping_np,
+                return_logprobs=return_logprobs,
+            )
+        )
+        target_probs = None
+        if use_flashinfer_top_p:
+            probs = processed_logits.softmax(dim=-1, dtype=torch.float32)
+            target_probs = top_p_renorm_probs(
+                probs,
+                top_p,
+                is_deterministic=True,
+            )
+            del probs
+        else:
+            processed_logits = self.sampler.sampling_states.apply_top_k_top_p(
+                processed_logits,
+                expanded_idx_mapping,
+                idx_mapping_np,
+            )
         sampled, num_sampled = rejection_sample(
             processed_logits,
             draft_logits,
@@ -162,6 +201,7 @@ class RejectionSampler:
             self.synthetic_conditional_rates,
             use_fp64=self.sampler.use_fp64_gumbel,
             use_block_verification=self.use_block_verification,
+            target_probs=target_probs,
         )
         return processed_logits, sampled, num_sampled
 
@@ -197,6 +237,7 @@ class RejectionSampler:
                 input_batch.idx_mapping_np[start:end],
                 input_batch.expanded_idx_mapping[lo:hi],
                 input_batch.expanded_local_pos[lo:hi],
+                return_logprobs=max_num_logprobs != NO_LOGPROBS,
             )
             chunk_logprobs = self._get_logprobs_tensors(
                 sampled,
@@ -242,7 +283,6 @@ class RejectionSampler:
 
         draft_sampled = input_batch.input_ids[input_batch.logits_indices]
         pos = input_batch.positions[input_batch.logits_indices]
-
         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
             input_batch.idx_mapping_np
         )
