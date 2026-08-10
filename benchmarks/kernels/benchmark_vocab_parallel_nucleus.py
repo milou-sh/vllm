@@ -99,6 +99,20 @@ def _make_logits(args, num_rows: int, device: torch.device) -> torch.Tensor:
     return logits
 
 
+def _load_tensor(
+    path: str,
+    key: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    value = torch.load(path, map_location="cpu", weights_only=True)
+    if isinstance(value, dict):
+        value = value.get(key)
+    if not isinstance(value, torch.Tensor):
+        raise ValueError(f"{path} does not contain tensor key {key!r}")
+    return value.to(device=device, dtype=dtype)
+
+
 def _make_fp8_lm_head_runner(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -184,6 +198,8 @@ def main():
     parser.add_argument("--valid-vocab", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=20260810)
     parser.add_argument("--logits-file")
+    parser.add_argument("--hidden-states-file")
+    parser.add_argument("--lm-head-weight-file")
     parser.add_argument("--measure-lm-head", action="store_true")
     parser.add_argument("--measure-fp8-lm-head", action="store_true")
     parser.add_argument("--measure-cudagraph", action="store_true")
@@ -373,20 +389,59 @@ def main():
     lm_head_graph_wall_ms = None
     fp8_lm_head_results = None
     if args.measure_lm_head or args.measure_fp8_lm_head:
-        torch.manual_seed(args.seed + 1000)
-        hidden_states = torch.randn(
-            num_rows,
-            args.model_hidden_size,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        torch.manual_seed(args.seed + 2000 + rank)
-        lm_head_weight = torch.randn(
-            local_vocab,
-            args.model_hidden_size,
-            dtype=torch.bfloat16,
-            device=device,
-        ).mul_(args.model_hidden_size**-0.5)
+        if args.hidden_states_file:
+            hidden_states = _load_tensor(
+                args.hidden_states_file.format(rank=rank),
+                "hidden_states",
+                device,
+                torch.bfloat16,
+            )
+            if hidden_states.ndim != 2 or hidden_states.shape[0] < num_rows:
+                raise ValueError(
+                    "captured hidden states must have shape "
+                    f"[at least {num_rows}, {args.model_hidden_size}]"
+                )
+            hidden_states = hidden_states[:num_rows]
+        else:
+            torch.manual_seed(args.seed + 1000)
+            hidden_states = torch.randn(
+                num_rows,
+                args.model_hidden_size,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        if hidden_states.shape[1] != args.model_hidden_size:
+            raise ValueError(
+                f"hidden size {hidden_states.shape[1]} does not match "
+                f"--model-hidden-size {args.model_hidden_size}"
+            )
+
+        if args.lm_head_weight_file:
+            lm_head_weight = _load_tensor(
+                args.lm_head_weight_file.format(rank=rank),
+                "weight",
+                torch.device("cpu"),
+                torch.bfloat16,
+            )
+            if lm_head_weight.shape[0] == args.vocab_size:
+                lm_head_weight = lm_head_weight[
+                    vocab_start : vocab_start + local_vocab
+                ].contiguous()
+            if lm_head_weight.shape != (local_vocab, args.model_hidden_size):
+                raise ValueError(
+                    "LM-head weight must be global [vocab, hidden] or local "
+                    f"[{local_vocab}, {args.model_hidden_size}], got "
+                    f"{tuple(lm_head_weight.shape)}"
+                )
+            lm_head_weight = lm_head_weight.to(device=device)
+        else:
+            torch.manual_seed(args.seed + 2000 + rank)
+            lm_head_weight = torch.randn(
+                local_vocab,
+                args.model_hidden_size,
+                dtype=torch.bfloat16,
+                device=device,
+            ).mul_(args.model_hidden_size**-0.5)
         lm_head_cuda_ms, lm_head_wall_ms = _time_ms(
             lambda: F.linear(hidden_states, lm_head_weight),
             args.warmup,
@@ -523,6 +578,8 @@ def main():
                     "full_graph_wall_median_ms": full_graph_wall_median,
                     "lm_head_cuda_median_ms": lm_head_cuda_median,
                     "lm_head_wall_median_ms": lm_head_wall_median,
+                    "hidden_states_file": args.hidden_states_file,
+                    "lm_head_weight_file": args.lm_head_weight_file,
                     "lm_head_graph_cuda_median_ms": lm_head_graph_cuda_median,
                     "lm_head_graph_wall_median_ms": lm_head_graph_wall_median,
                     "fp8_lm_head": fp8_lm_head_results,
