@@ -19,6 +19,9 @@ from vllm.model_executor.models.mistral_large_3_eagle import (
 )
 from vllm.v1.attention.backends import flash_attn as flash_attn_module
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
+from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
+    FlashAttnMLASparseMetadataBuilder,
+)
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.spec_decode import speculator as base_spec_module
 from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as spec_module
@@ -383,7 +386,7 @@ def test_update_draft_decode_metadata_updates_fa3_scheduler_metadata(
         max_num_splits=4,
         causal=True,
         sliding_window=None,
-        mm_prefix_range_tensor=None,
+        mm_prefix_query_range_tensor=None,
         rswa_prefix_lens=None,
         rswa_window=None,
         rswa_window_tensor=None,
@@ -434,7 +437,7 @@ def test_update_draft_decode_metadata_skips_non_fa3_builders(monkeypatch):
         max_num_splits=1,
         causal=True,
         sliding_window=None,
-        mm_prefix_range_tensor=None,
+        mm_prefix_query_range_tensor=None,
         rswa_prefix_lens=None,
         rswa_window=None,
         rswa_window_tensor=None,
@@ -447,3 +450,26 @@ def test_update_draft_decode_metadata_skips_non_fa3_builders(monkeypatch):
         metadata.scheduler_metadata,
         torch.tensor([5], dtype=torch.int32),
     )
+
+
+def test_flashattn_mla_sparse_supports_fused_draft_metadata():
+    assert FlashAttnMLASparseMetadataBuilder.supports_draft_decode_metadata_update
+    builder = object.__new__(FlashAttnMLASparseMetadataBuilder)
+    assert builder.update_draft_decode_metadata(None) is None
+
+
+def test_flashattn_mla_sparse_enables_fused_multi_step_decode():
+    speculator = object.__new__(_TestSpeculator)
+    speculator.num_speculative_steps = 3
+    speculator.attn_groups = [
+        [
+            SimpleNamespace(
+                backend=SimpleNamespace(get_name=lambda: "FLASH_ATTN_MLA_SPARSE"),
+                supports_draft_decode_metadata_update=True,
+            )
+        ]
+    ]
+
+    speculator._configure_fused_multi_step_decode()
+
+    assert speculator.use_fused_multi_step_decode

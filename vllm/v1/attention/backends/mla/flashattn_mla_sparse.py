@@ -142,6 +142,7 @@ class FlashAttnMLASparseMetadataBuilder(
 ):
     metadata_cls = FlashAttnMLASparseMetadata
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    supports_draft_decode_metadata_update = True
 
     def __init__(
         self,
@@ -157,6 +158,12 @@ class FlashAttnMLASparseMetadataBuilder(
         )
         threshold = {16: 128, 32: 128, 64: 256, 128: 256}.get(num_q_heads, 256)
         self._init_reorder_batch_threshold(threshold, supports_spec_as_decode=True)
+
+    def update_draft_decode_metadata(
+        self, metadata: FlashAttnMLASparseMetadata
+    ) -> None:
+        # Query starts are fixed and sequence lengths are live device views.
+        pass
 
 
 class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):

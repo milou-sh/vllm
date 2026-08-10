@@ -111,6 +111,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 "between draft steps.",
                 ", ".join(unsupported_backends),
             )
+        else:
+            logger.info_once(
+                "Fused multi-step draft decode enabled for %d speculative steps.",
+                self.num_speculative_steps,
+            )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         # Initialize cudagraph manager for draft prefill (draft position 0).
