@@ -75,6 +75,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.flashinfer_all_reduce import (
             FlashInferAllReduce,
         )
+        from vllm.distributed.device_communicators.push_all_reduce import (
+            PushAllReduce,
+        )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.device_communicators.quick_all_reduce import (
             QuickAllReduce,
@@ -91,6 +94,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 register_nccl_symmetric_ops(self.pynccl_comm)
 
         self.ca_comm: CustomAllreduce | None = None
+        self.push_ar_comm: PushAllReduce | None = None
         self.qr_comm: QuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
@@ -132,6 +136,27 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # On ROCm, 'use_custom_allreduce==True' means it must currently be
             # an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+
+        if (
+            use_custom_allreduce
+            and self.world_size > 1
+            and current_platform.is_cuda()
+            and self.ca_comm is not None
+            and not self.ca_comm.disabled
+        ):
+            try:
+                from vllm.distributed.device_communicators.push_all_reduce import (
+                    PushAllReduce,
+                )
+
+                self.push_ar_comm = PushAllReduce(
+                    group=self.cpu_group, device=self.device
+                )
+                if self.push_ar_comm.disabled:
+                    self.push_ar_comm = None
+            except Exception as error:
+                logger.warning("PushAllReduce initialization failed: %s", error)
+                self.push_ar_comm = None
 
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
@@ -221,6 +246,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "QUICK_REDUCE",
             "FLASHINFER",
             "AITER_CUSTOM",
+            "PUSH_AR",
             "CUSTOM",
             "SYMM_MEM",
             "PYNCCL",
@@ -256,6 +282,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             enabled_ar_backends.append("FLASHINFER")
         if self.aiter_ar_comm is not None and not self.aiter_ar_comm.disabled:
             enabled_ar_backends.append("AITER_CUSTOM")
+        if self.push_ar_comm is not None:
+            enabled_ar_backends.append("PUSH_AR")
         if self.ca_comm is not None and not self.ca_comm.disabled:
             enabled_ar_backends.append("CUSTOM")
         if self.symm_mem_comm is not None and not self.symm_mem_comm.disabled:
@@ -310,6 +338,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = aiter_ar_comm.custom_all_reduce(input_)
             assert out is not None
             return out
+        push_ar_comm = self.push_ar_comm
+        if push_ar_comm is not None and push_ar_comm.should_use(input_):
+            out = push_ar_comm.all_reduce(input_)
+            if out is not None:
+                return out
         ca_comm = self.ca_comm
         if (
             ca_comm is not None
@@ -573,6 +606,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
+        if self.push_ar_comm is not None:
+            self.push_ar_comm.close()
+            self.push_ar_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
         if self.aiter_ar_comm is not None:
