@@ -127,6 +127,7 @@ class FlashAttnMLASparseMetadata(AttentionMetadata):
     block_table: torch.Tensor
     req_id_per_token: torch.Tensor
     seq_lens: torch.Tensor
+    cu_seqlens_q: torch.Tensor | None = None
     block_size: int = 64
     topk_tokens: int = 2048
     num_decodes: int = 0
@@ -152,11 +153,29 @@ class FlashAttnMLASparseMetadataBuilder(
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
 
+        self.cu_seqlens_q = torch.arange(
+            vllm_config.scheduler_config.max_num_batched_tokens + 1,
+            dtype=torch.int32,
+            device=device,
+        )
+
         num_q_heads = self.model_config.get_num_attention_heads(
             vllm_config.parallel_config
         )
         threshold = {16: 128, 32: 128, 64: 256, 128: 256}.get(num_q_heads, 256)
         self._init_reorder_batch_threshold(threshold, supports_spec_as_decode=True)
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: Any,
+        fast_build: bool = False,
+    ) -> FlashAttnMLASparseMetadata:
+        metadata = super().build(
+            common_prefix_len, common_attn_metadata, fast_build=fast_build
+        )
+        metadata.cu_seqlens_q = self.cu_seqlens_q
+        return metadata
 
 
 class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
@@ -232,9 +251,8 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
             return_valid_counts=True,
         )
 
-        cu_seqlens_q = torch.arange(
-            0, num_actual_toks + 1, dtype=torch.int32, device=q_rope.device
-        )
+        assert attn_metadata.cu_seqlens_q is not None
+        cu_seqlens_q = attn_metadata.cu_seqlens_q[: num_actual_toks + 1]
         kv_cache = kv_c_and_k_pe_cache.view(
             -1, attn_metadata.block_size, self.head_size
         )
