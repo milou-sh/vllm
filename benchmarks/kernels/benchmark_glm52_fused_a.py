@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 from functools import partial
 
 import torch
@@ -10,6 +11,8 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.model_executor.models import deepseek_v2  # noqa: F401
 from vllm.triton_utils import triton
+
+os.environ.setdefault("VLLM_GLM52_SM90_FUSED_A_GEMM", "1")
 
 PROJECTIONS = {
     "fused_qkv_a_proj": (6144, 2624),
@@ -42,7 +45,10 @@ def _direct_op(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tokens", default=",".join(str(i) for i in range(1, 17)))
+    parser.add_argument(
+        "--tokens",
+        default=",".join(str(i) for i in (*range(1, 17), 24, 32, 40, 48, 56, 64)),
+    )
     parser.add_argument("--projections", default=",".join(PROJECTIONS))
     args = parser.parse_args()
 

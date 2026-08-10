@@ -620,6 +620,8 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
 
   int cta_m_idx = tile_m * blockIdx.x;
   int cta_n_idx = tile_n * blockIdx.y;
+  int cta_gemm_n = gemm_n - cta_n_idx;
+  cta_gemm_n = cta_gemm_n < tile_n ? cta_gemm_n : tile_n;
   bf16_t const* gmem_a_local = mat_a + cta_m_idx * gemm_k;
   bf16_t const* gmem_b_local = mat_b + cta_n_idx * gemm_k;
   bf16_t* gmem_c_local = output + cta_n_idx * gemm_m + cta_m_idx;
@@ -643,12 +645,12 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
     a_loader.issue_mainloop();
   } else if (warp_idx < 4) {
     GmemLoaderB<gemm_k, tile_n, tile_k, stage_cnt> b_loader(
-        gmem_b_local, smem_b, smem_barrier, gemm_n);
+        gmem_b_local, smem_b, smem_barrier, cta_gemm_n);
     b_loader.prepare();
     b_loader.issue_mainloop();
   } else {
     MmaComputer<gemm_m, gemm_k, tile_m, tile_n, tile_k, stage_cnt> mma_computer(
-        gmem_c_local, smem_a, smem_b, smem_barrier, warp_idx, gemm_n);
+        gmem_c_local, smem_a, smem_b, smem_barrier, warp_idx, cta_gemm_n);
     mma_computer.prepare();
     mma_computer.issue_mainloop();
     mma_computer.epi();
@@ -727,8 +729,8 @@ void dsv3_fused_a_gemm(torch::stable::Tensor& output,
   int const hd_in = mat_a.size(1);
   int const hd_out = mat_b.size(1);
 
-  STD_TORCH_CHECK(num_tokens >= 1 && num_tokens <= 16,
-                  "required 1 <= mat_a.shape[0] <= 16");
+  STD_TORCH_CHECK(num_tokens >= 1 && num_tokens <= 64,
+                  "required 1 <= mat_a.shape[0] <= 64");
   STD_TORCH_CHECK(output.size(0) == num_tokens,
                   "required output.shape[0] == mat_a.shape[0]");
   STD_TORCH_CHECK(output.size(1) == hd_out,

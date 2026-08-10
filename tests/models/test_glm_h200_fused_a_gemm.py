@@ -28,10 +28,12 @@ def test_glm_fused_a_is_opt_in_on_sm90(monkeypatch) -> None:
     )
     monkeypatch.setattr(envs, "VLLM_GLM52_SM90_FUSED_A_GEMM", False)
     assert not deepseek_v2._supports_min_latency_fused_qkv_a(_weight(2624, 6144))
+    assert deepseek_v2._min_latency_fused_a_max_tokens(_weight(2624, 6144)) == 16
 
     monkeypatch.setattr(envs, "VLLM_GLM52_SM90_FUSED_A_GEMM", True)
     assert deepseek_v2._supports_min_latency_fused_qkv_a(_weight(2624, 6144))
     assert deepseek_v2._supports_min_latency_fused_qkv_a(_weight(8192, 2048))
+    assert deepseek_v2._min_latency_fused_a_max_tokens(_weight(2624, 6144)) == 64
     assert not deepseek_v2._supports_min_latency_fused_qkv_a(_weight(2625, 6144))
     assert not deepseek_v2._supports_min_latency_fused_qkv_a(
         _weight(2624, 6144, torch.float16)
@@ -91,3 +93,5 @@ def test_tp4_q_b_kernel_shape_is_instantiated() -> None:
         / "csrc/libtorch_stable/dsv3_fused_a_gemm.cu"
     ).read_text()
     assert "DISPATCH_DSV3_SHAPE(2048, 8192)" in source
+    assert "gemm_n - cta_n_idx" in source
+    assert "num_tokens <= 64" in source

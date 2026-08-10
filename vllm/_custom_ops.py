@@ -3267,7 +3267,7 @@ def dsv3_fused_a_gemm(
     mat_b: torch.Tensor,
     enable_pdl: bool = False,
 ) -> None:
-    """Low-latency fused-A-style GEMM (SM 9.0+, BF16, 1-16 tokens).
+    """Low-latency fused-A-style GEMM (SM 9.0+, BF16, 1-64 tokens).
 
     Computes ``output = mat_a @ mat_b`` for the compiled Kimi K3 and
     DeepSeek V3 projection shapes. ``mat_a`` and ``output`` are row-major;

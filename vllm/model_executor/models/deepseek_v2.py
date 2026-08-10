@@ -875,6 +875,18 @@ def _try_load_fp8_indexer_wk(
     return True
 
 
+_GLM52_SM90_FUSED_A_SHAPES = ((2624, 6144), (8192, 2048))
+
+
+def _min_latency_fused_a_max_tokens(weight: torch.Tensor) -> int:
+    if (
+        envs.VLLM_GLM52_SM90_FUSED_A_GEMM
+        and tuple(weight.shape) in _GLM52_SM90_FUSED_A_SHAPES
+    ):
+        return 64
+    return 16
+
+
 def _min_latency_fused_qkv_a_proj_impl(
     input_: torch.Tensor,
     weight: torch.Tensor,
@@ -885,7 +897,7 @@ def _min_latency_fused_qkv_a_proj_impl(
     does not support runtime dispatching on num_tokens.
     """
     num_tokens = input_.shape[0]
-    if 0 < num_tokens <= 16:
+    if 0 < num_tokens <= _min_latency_fused_a_max_tokens(weight):
         output = torch.empty(
             num_tokens,
             weight.shape[0],
@@ -923,7 +935,7 @@ def _supports_min_latency_fused_qkv_a(weight: torch.Tensor) -> bool:
         ) or current_platform.is_device_capability_family(100)
     return (
         envs.VLLM_GLM52_SM90_FUSED_A_GEMM
-        and shape in ((2624, 6144), (8192, 2048))
+        and shape in _GLM52_SM90_FUSED_A_SHAPES
         and current_platform.is_device_capability(90)
     )
 
@@ -935,7 +947,9 @@ class Glm52SM90FusedALinearMethod(UnquantizedLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if bias is None and 0 < x.shape[0] <= 16:
+        if bias is None and 0 < x.shape[0] <= _min_latency_fused_a_max_tokens(
+            layer.weight
+        ):
             return torch.ops.vllm.min_latency_fused_qkv_a_proj(x, layer.weight)
         return super().apply(layer, x, bias)
 
