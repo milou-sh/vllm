@@ -1197,6 +1197,10 @@ class DeepseekV2MLAAttention(nn.Module):
         return self.mla_attn(positions, hidden_states, llama_4_scaling)
 
 
+def _compiler_sequence_parallel_enabled(vllm_config: VllmConfig) -> bool:
+    return bool(vllm_config.compilation_config.pass_config.enable_sp)
+
+
 class DeepseekV2DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1252,7 +1256,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             and is_moe_layer
         )
         self.fuse_attention_allreduce_rms = (
-            config.model_type == "glm_moe_dsa" and not self.use_sequence_parallel_moe
+            config.model_type == "glm_moe_dsa"
+            and not self.use_sequence_parallel_moe
+            and not _compiler_sequence_parallel_enabled(vllm_config)
         )
         self.self_attn = attn_cls(
             vllm_config=vllm_config,
@@ -1399,6 +1405,7 @@ class DeepseekV2Model(nn.Module):
         self.fuse_mlp_allreduce_rms = (
             config.model_type == "glm_moe_dsa"
             and vllm_config.parallel_config.pipeline_parallel_size == 1
+            and not _compiler_sequence_parallel_enabled(vllm_config)
         )
         if self.is_v32:
             topk_tokens = config.index_topk
