@@ -62,6 +62,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
@@ -922,9 +923,32 @@ def _supports_min_latency_fused_qkv_a(weight: torch.Tensor) -> bool:
         ) or current_platform.is_device_capability_family(100)
     return (
         envs.VLLM_GLM52_SM90_FUSED_A_GEMM
-        and shape == (2624, 6144)
+        and shape in ((2624, 6144), (8192, 2048))
         and current_platform.is_device_capability(90)
     )
+
+
+class Glm52SM90FusedALinearMethod(UnquantizedLinearMethod):
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if bias is None and 0 < x.shape[0] <= 16:
+            return torch.ops.vllm.min_latency_fused_qkv_a_proj(x, layer.weight)
+        return super().apply(layer, x, bias)
+
+
+def _enable_glm52_sm90_q_b_fused_a(layer: nn.Module) -> None:
+    weight = getattr(layer, "weight", None)
+    if (
+        weight is not None
+        and tuple(weight.shape) == (8192, 2048)
+        and _supports_min_latency_fused_qkv_a(weight)
+        and type(layer.quant_method) is UnquantizedLinearMethod
+    ):
+        layer.quant_method = Glm52SM90FusedALinearMethod()
 
 
 class DeepSeekV2FusedQkvAProjLinear(MergedColumnParallelLinear):
@@ -1048,6 +1072,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_b_proj",
             )
+            _enable_glm52_sm90_q_b_fused_a(self.q_b_proj)
         else:
             self.q_proj = q_proj_cls(
                 proj_input_size,

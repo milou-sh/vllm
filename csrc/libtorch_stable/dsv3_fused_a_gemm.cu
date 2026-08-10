@@ -799,6 +799,7 @@ void dsv3_fused_a_gemm(torch::stable::Tensor& output,
     return;
   }
   DISPATCH_DSV3_SHAPE(2048, 2048)
+  DISPATCH_DSV3_SHAPE(2048, 8192)
 
 #ifdef VLLM_K3_BENCH_SHAPES
   // The selector routes these shapes to CuTe or the default GEMM, so they are
