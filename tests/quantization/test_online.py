@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -16,7 +17,14 @@ from tests.quantization.utils import (
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm._custom_ops import scaled_fp4_quant
+from vllm.config.quantization import QuantizationConfigArgs
+from vllm.model_executor import parameter as parameter_module
+from vllm.model_executor.layers import vocab_parallel_embedding as vocab_embedding
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.layers.quantization.online import fp8 as online_fp8
+from vllm.model_executor.layers.quantization.online.base import (
+    OnlineQuantizationConfig,
+)
 from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerBlockOnlineLinearMethod,
     Fp8PerBlockOnlineMoEMethod,
@@ -42,6 +50,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     amax_for_tp_weight_quant,
     weight_amax,
 )
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
 
@@ -57,6 +66,72 @@ else:
 
 
 DEVICE = current_platform.device_type
+
+
+def test_online_config_dispatches_parallel_lm_head(monkeypatch) -> None:
+    config = OnlineQuantizationConfig(QuantizationConfigArgs(lm_head="fp8_per_channel"))
+    expected = Mock()
+    dispatch = Mock(return_value=expected)
+    monkeypatch.setattr(config, "_dispatch", dispatch)
+    layer = Mock(spec=ParallelLMHead)
+    layer.__class__ = ParallelLMHead
+
+    assert config.get_quant_method(layer, "lm_head") is expected
+    dispatch.assert_called_once()
+    assert dispatch.call_args.args[0] == config.args.lm_head
+    assert dispatch.call_args.args[2] is layer
+
+
+def test_online_linear_records_unsharded_dimensions(monkeypatch) -> None:
+    monkeypatch.setattr(online_fp8, "initialize_online_processing", Mock())
+    monkeypatch.setattr(
+        online_fp8,
+        "ModelWeightParameter",
+        lambda data, **kwargs: torch.nn.Parameter(data, requires_grad=False),
+    )
+    method = object.__new__(Fp8PerTensorOnlineLinearMethod)
+    layer = torch.nn.Module()
+
+    online_fp8._Fp8OnlineLinearBase.create_weights(
+        method,
+        layer,
+        input_size_per_partition=64,
+        output_partition_sizes=[32],
+        input_size=64,
+        output_size=128,
+        params_dtype=torch.bfloat16,
+    )
+
+    assert layer.input_size == 64
+    assert layer.input_size_per_partition == 64
+    assert layer.output_size == 128
+    assert layer.output_size_per_partition == 32
+
+
+def test_parallel_lm_head_constructs_with_online_fp8(monkeypatch) -> None:
+    monkeypatch.setattr(
+        online_fp8,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16)),
+    )
+    monkeypatch.setattr(online_fp8, "init_fp8_linear_kernel", Mock(return_value=Mock()))
+    monkeypatch.setattr(vocab_embedding, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        vocab_embedding, "get_tensor_model_parallel_world_size", lambda: 4
+    )
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 4
+    )
+    config = OnlineQuantizationConfig(QuantizationConfigArgs(lm_head="fp8_per_channel"))
+
+    head = ParallelLMHead(128, 64, quant_config=config)
+
+    assert isinstance(head.quant_method, online_fp8.Fp8PtpcOnlineLinearMethod)
+    assert head.weight.device.type == "meta"
+    assert head.weight.shape == (32, 64)
+    assert head.input_size == 64
+    assert head.output_size == 128
 
 
 @pytest.mark.skipif(

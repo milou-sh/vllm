@@ -67,15 +67,18 @@ quantization_config:
   moe:
     weight: <name>
     activation: <name>
+  lm_head:
+    weight: <name>
+    activation: <name>
   ignore: [<layer-name-or-regex>, ...]
 ```
 
-`linear` and `moe` accept a full `{weight, activation}` dict, or a bare
-string. A string resolves first against the `--quantization` shorthands
-(taking the matching layer-kind slot), then against `QUANT_KEY_NAMES` as a
-weight name. Unset fields fall back to the `--quantization` shorthand's
-defaults, or for already-quantized checkpoints to whatever the checkpoint
-declares.
+`linear`, `moe`, and `lm_head` accept a full `{weight, activation}` dict, or a
+bare string. A string resolves first against the `--quantization` shorthands
+(the LM head uses the shorthand's linear scheme), then against
+`QUANT_KEY_NAMES` as a weight name. Unset fields fall back to the
+`--quantization` shorthand's defaults, or for already-quantized checkpoints to
+whatever the checkpoint declares.
 
 On XPU, non-block FP8 scaled-mm linear layers default to W8A16; setting `--linear-backend xpu` forces W8A8. Use `--linear-backend xpu_woq` to explicitly select weight-only quantization (W8A16). Setting `--linear-backend torch` also forces W8A8 but runs the GEMM through `torch._scaled_mm` instead of the custom XPU kernel.
 
@@ -98,6 +101,21 @@ vllm serve openai/gpt-oss-20b --quantization-config.moe.activation mxfp8
 ```
 
 Combine with `--moe-backend` to pin a specific kernel family.
+
+### Online LM-head override on a quantized checkpoint
+
+An untied BF16/FP16 `ParallelLMHead` can be quantized during loading even when
+the rest of the checkpoint already uses compressed-tensors quantization:
+
+```bash
+vllm serve <compressed-tensors-model> \
+    --quantization-config.lm-head fp8_per_channel
+```
+
+This does not replace an LM head that is already quantized in the checkpoint.
+Per-channel FP8 weights with dynamic per-token activations generally preserve
+the output distribution better than a per-tensor weight scale, but the best
+choice is model- and hardware-dependent.
 
 ### Separate Schemes for Dense and MoE Layers
 

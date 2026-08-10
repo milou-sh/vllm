@@ -134,7 +134,9 @@ class _Fp8OnlineLinearBase(LinearMethodBase):
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.logical_widths = output_partition_sizes
+        layer.input_size = input_size
         layer.input_size_per_partition = input_size_per_partition
+        layer.output_size = output_size
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None

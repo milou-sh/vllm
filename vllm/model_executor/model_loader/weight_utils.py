@@ -284,7 +284,15 @@ def get_quant_config(
         ):
             pass  # fall through to file-based loading below
         else:
-            return quant_cls.from_config(hf_quant_config)
+            quant_config = quant_cls.from_config(hf_quant_config)
+            if model_config.quantization_config is not None:
+                from vllm.config.quantization import QuantizationConfigArgs
+
+                user_quant_config = model_config.quantization_config
+                if isinstance(user_quant_config, dict):
+                    user_quant_config = QuantizationConfigArgs(**user_quant_config)
+                quant_config.apply_user_quantization_config(user_quant_config)
+            return quant_config
 
     # if hf_quant_config is None, we will try to get config from
     # hf_overrides
