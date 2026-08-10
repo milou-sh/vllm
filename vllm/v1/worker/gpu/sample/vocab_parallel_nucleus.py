@@ -381,6 +381,9 @@ def _one_hot_rejection_kernel(
     start = tl.load(cu_num_logits_ptr + req_idx)
     end = tl.load(cu_num_logits_ptr + req_idx + 1)
     num_draft_tokens = end - start - 1
+    if end <= start:
+        tl.store(num_sampled_ptr + req_idx, 0)
+        return
     accepted = tl.zeros((), tl.int32)
     verifying = True
     for i in tl.range(num_draft_tokens):

@@ -6,6 +6,7 @@ import torch
 
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.vocab_parallel_nucleus import (
+    _one_hot_rejection_kernel,
     distributed_bf16_top_p_cutoff,
     distributed_nucleus_candidates,
     distributed_one_hot_rejection_sample,
@@ -234,3 +235,26 @@ def test_one_hot_rejection_matches_full_vocab_kernel():
     torch.testing.assert_close(
         actual.sampled[valid], expected_sampled[valid], rtol=0, atol=0
     )
+
+
+def test_one_hot_rejection_ignores_empty_graph_padding_requests():
+    sampled = torch.full((2, 4), -1, dtype=torch.int64, device="cuda")
+    num_sampled = torch.full((2,), -1, dtype=torch.int32, device="cuda")
+    rows = torch.arange(4, device="cuda")
+    _one_hot_rejection_kernel[(2,)](
+        sampled,
+        sampled.stride(0),
+        num_sampled,
+        torch.zeros(4, device="cuda"),
+        rows,
+        rows + 10,
+        rows + 20,
+        torch.tensor([0, 4, 4], dtype=torch.int32, device="cuda"),
+        torch.zeros(2, dtype=torch.int32, device="cuda"),
+        torch.ones(1, dtype=torch.int64, device="cuda"),
+        rows,
+        num_warps=1,
+    )
+
+    assert num_sampled[1].item() == 0
+    assert sampled[0, -1].item() == -1

@@ -280,6 +280,7 @@ if TYPE_CHECKING:
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_GLM52_DISTRIBUTED_NUCLEUS: bool = False
+    VLLM_GLM52_DISTRIBUTED_NUCLEUS_GRAPH: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -1938,6 +1939,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Debug workspace allocations.
     # logging of workspace resize operations.
     "VLLM_DEBUG_WORKSPACE": lambda: bool(int(os.getenv("VLLM_DEBUG_WORKSPACE", "0"))),
+    "VLLM_GLM_TARGET_SAMPLER_GRAPH": lambda: bool(
+        int(os.getenv("VLLM_GLM_TARGET_SAMPLER_GRAPH", "0"))
+    ),
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
@@ -1975,6 +1979,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM52_DISTRIBUTED_NUCLEUS": lambda: bool(
         int(os.getenv("VLLM_GLM52_DISTRIBUTED_NUCLEUS", "0"))
+    ),
+    "VLLM_GLM52_DISTRIBUTED_NUCLEUS_GRAPH": lambda: bool(
+        int(os.getenv("VLLM_GLM52_DISTRIBUTED_NUCLEUS_GRAPH", "0"))
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
