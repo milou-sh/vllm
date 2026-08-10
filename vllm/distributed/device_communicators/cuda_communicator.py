@@ -154,7 +154,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 )
                 if self.push_ar_comm.disabled:
                     self.push_ar_comm = None
-            except Exception:
+            except Exception as error:
+                logger.warning("PushAllReduce initialization failed: %s", error)
                 self.push_ar_comm = None
 
         if self.world_size > 1:

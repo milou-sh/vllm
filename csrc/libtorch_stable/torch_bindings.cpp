@@ -1008,6 +1008,31 @@ STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CompositeExplicitAutograd, custom_ar) {
   custom_ar.impl("free_shared_buffer", TORCH_BOX(&free_shared_buffer));
 }
 
+#ifdef USE_CUDA
+STABLE_TORCH_LIBRARY_FRAGMENT(_C_push_ar, push_ar) {
+  push_ar.def(
+      "init_push_ar(int rank, int world_size, int buffer_bytes, int max_cta) "
+      "-> int");
+  push_ar.def("get_push_ar_ipc_handle(int manager) -> Tensor");
+  push_ar.def("post_init_push_ar(int manager, Tensor all_handles) -> ()");
+  push_ar.def(
+      "push_ar_all_reduce(int manager, Tensor input, Tensor! output) -> ()");
+  push_ar.def("dispose_push_ar(int manager) -> ()");
+}
+
+STABLE_TORCH_LIBRARY_IMPL(_C_push_ar, CUDA, push_ar) {
+  push_ar.impl("push_ar_all_reduce", TORCH_BOX(&push_ar_all_reduce));
+}
+
+STABLE_TORCH_LIBRARY_IMPL(_C_push_ar, CompositeExplicitAutograd, push_ar) {
+  push_ar.impl("init_push_ar", TORCH_BOX(&init_push_ar));
+  push_ar.impl("get_push_ar_ipc_handle",
+               TORCH_BOX(&get_push_ar_ipc_handle));
+  push_ar.impl("post_init_push_ar", TORCH_BOX(&post_init_push_ar));
+  push_ar.impl("dispose_push_ar", TORCH_BOX(&dispose_push_ar));
+}
+#endif
+
 STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CPU, ops) {
   ops.impl("swap_blocks_batch", TORCH_BOX(&swap_blocks_batch));
 }

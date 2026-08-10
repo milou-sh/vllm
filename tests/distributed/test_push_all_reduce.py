@@ -67,6 +67,11 @@ def test_push_ar_ops_registered():
     assert hasattr(ops, "post_init_push_ar")
     assert hasattr(ops, "push_ar_all_reduce")
     assert hasattr(ops, "dispose_push_ar")
+    assert hasattr(torch.ops._C_push_ar, "init_push_ar")
+    assert hasattr(torch.ops._C_push_ar, "get_push_ar_ipc_handle")
+    assert hasattr(torch.ops._C_push_ar, "post_init_push_ar")
+    assert hasattr(torch.ops._C_push_ar, "push_ar_all_reduce")
+    assert hasattr(torch.ops._C_push_ar, "dispose_push_ar")
 
 
 # ============================================================
