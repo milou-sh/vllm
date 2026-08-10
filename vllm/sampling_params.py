@@ -61,9 +61,7 @@ def resolve_thinking_token_budget(
     value = validate_thinking_token_budget(value)
     if value is not None:
         return value
-    default = validate_thinking_token_budget(
-        envs.VLLM_DEFAULT_THINKING_TOKEN_BUDGET
-    )
+    default = validate_thinking_token_budget(envs.VLLM_DEFAULT_THINKING_TOKEN_BUDGET)
     if default is None:
         return None
     return min(default, max_tokens // 2)

@@ -91,6 +91,9 @@ from vllm.model_executor.models.utils import (
     extract_layer_index,
     sequence_parallel_chunk,
 )
+from vllm.models.common.ops.fused_allreduce_rms_norm import (
+    fused_allreduce_rms_norm,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -1248,6 +1251,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             and parallel_config.pipeline_parallel_size == 1
             and is_moe_layer
         )
+        self.fuse_attention_allreduce_rms = (
+            config.model_type == "glm_moe_dsa" and not self.use_sequence_parallel_moe
+        )
         self.self_attn = attn_cls(
             vllm_config=vllm_config,
             config=config,
@@ -1263,7 +1269,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             topk_indices_buffer=topk_indices_buffer,
-            reduce_results=not self.use_sequence_parallel_moe,
+            reduce_results=not self.fuse_attention_allreduce_rms,
         )
 
         if is_moe_layer:
@@ -1272,6 +1278,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                reduce_results=not self.fuse_attention_allreduce_rms,
                 # aiter applies routed_scaling_factor internally
                 apply_routed_scale_to_output=not rocm_aiter_ops.is_fused_moe_enabled(),
             )
@@ -1282,6 +1289,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                reduce_results=not self.fuse_attention_allreduce_rms,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -1307,6 +1315,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif self.fuse_attention_allreduce_rms:
+            hidden_states, residual = fused_allreduce_rms_norm(
+                hidden_states, residual, self.input_layernorm
+            )
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
@@ -1343,7 +1355,14 @@ class DeepseekV2DecoderLayer(nn.Module):
                 residual = sequence_parallel_chunk(residual)
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self.fuse_attention_allreduce_rms:
+            hidden_states, residual = fused_allreduce_rms_norm(
+                hidden_states, residual, self.post_attention_layernorm
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
         if self.use_sequence_parallel_moe:
             hidden_states = self.mlp(
                 hidden_states,
@@ -1377,6 +1396,10 @@ class DeepseekV2Model(nn.Module):
         self.hidden_size = config.hidden_size
         self.vocab_size = config.vocab_size
         self.is_v32 = hasattr(config, "index_topk")
+        self.fuse_mlp_allreduce_rms = (
+            config.model_type == "glm_moe_dsa"
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+        )
         if self.is_v32:
             topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(
@@ -1511,7 +1534,12 @@ class DeepseekV2Model(nn.Module):
         if self.end_layer in self.aux_hidden_state_layers:
             aux_hidden_states.append(hidden_states + residual)
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if self.fuse_mlp_allreduce_rms:
+            hidden_states, _ = fused_allreduce_rms_norm(
+                hidden_states, residual, self.norm
+            )
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
