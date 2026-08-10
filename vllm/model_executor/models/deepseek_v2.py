@@ -43,8 +43,8 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
-    tensor_model_parallel_reduce_scatter,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention, RSWAAttention
@@ -93,6 +93,12 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.models.common.ops.fused_allreduce_rms_norm import (
     fused_allreduce_rms_norm,
+)
+from vllm.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_padding_mask,
+    sp_reduce_scatter,
+    sp_shard,
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -1251,8 +1257,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             and parallel_config.pipeline_parallel_size == 1
             and is_moe_layer
         )
+        self.use_sequence_parallel = (
+            config.model_type == "glm_moe_dsa"
+            and parallel_config.use_sequence_parallel_moe
+            and parallel_config.pipeline_parallel_size == 1
+        )
         self.fuse_attention_allreduce_rms = (
-            config.model_type == "glm_moe_dsa" and not self.use_sequence_parallel_moe
+            config.model_type == "glm_moe_dsa" and not self.use_sequence_parallel
         )
         self.self_attn = attn_cls(
             vllm_config=vllm_config,
@@ -1269,7 +1280,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             topk_indices_buffer=topk_indices_buffer,
-            reduce_results=not self.fuse_attention_allreduce_rms,
+            reduce_results=not (
+                self.fuse_attention_allreduce_rms or self.use_sequence_parallel
+            ),
         )
 
         if is_moe_layer:
@@ -1278,7 +1291,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
-                reduce_results=not self.fuse_attention_allreduce_rms,
+                reduce_results=not (
+                    self.fuse_attention_allreduce_rms or self.use_sequence_parallel
+                ),
                 # aiter applies routed_scaling_factor internally
                 apply_routed_scale_to_output=not rocm_aiter_ops.is_fused_moe_enabled(),
             )
@@ -1289,7 +1304,10 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
-                reduce_results=not self.fuse_attention_allreduce_rms,
+                reduce_results=not (
+                    self.fuse_attention_allreduce_rms or self.use_sequence_parallel
+                ),
+                is_sequence_parallel=self.use_sequence_parallel,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -1305,16 +1323,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
         full_num_tokens = positions.shape[0]
-        input_is_sequence_parallel = (
-            self.use_sequence_parallel_moe
-            and residual is not None
-            and hidden_states.shape[0] != full_num_tokens
-        )
 
         # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif self.use_sequence_parallel:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         elif self.fuse_attention_allreduce_rms:
             hidden_states, residual = fused_allreduce_rms_norm(
                 hidden_states, residual, self.input_layernorm
@@ -1322,9 +1337,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        if input_is_sequence_parallel:
-            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-            hidden_states = hidden_states[:full_num_tokens]
+        if self.use_sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
         if self.use_mha:
             hidden_states = self.self_attn(positions, hidden_states)
@@ -1344,18 +1358,15 @@ class DeepseekV2DecoderLayer(nn.Module):
                 # first layer.
                 residual *= 1.0 / self.routed_scaling_factor
 
-        if self.use_sequence_parallel_moe:
-            tp_world_size = get_tensor_model_parallel_world_size()
-            # small trick using minus, eg. -17 % 8 = 7
-            sp_pad = (-hidden_states.shape[0]) % tp_world_size
-            # pad if not divisible by world size
-            hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, sp_pad))
-            hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
-            if not input_is_sequence_parallel:
-                residual = sequence_parallel_chunk(residual)
+        if self.use_sequence_parallel:
+            hidden_states = sp_reduce_scatter(hidden_states)
 
         # Fully Connected
-        if self.fuse_attention_allreduce_rms:
+        if self.use_sequence_parallel:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+        elif self.fuse_attention_allreduce_rms:
             hidden_states, residual = fused_allreduce_rms_norm(
                 hidden_states, residual, self.post_attention_layernorm
             )
@@ -1363,7 +1374,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
-        if self.use_sequence_parallel_moe:
+        if self.use_sequence_parallel and isinstance(self.mlp, DeepseekV2MoE):
             hidden_states = self.mlp(
                 hidden_states,
                 already_sequence_parallel=True,
@@ -1396,9 +1407,15 @@ class DeepseekV2Model(nn.Module):
         self.hidden_size = config.hidden_size
         self.vocab_size = config.vocab_size
         self.is_v32 = hasattr(config, "index_topk")
+        self.use_sequence_parallel = (
+            config.model_type == "glm_moe_dsa"
+            and vllm_config.parallel_config.use_sequence_parallel_moe
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+        )
         self.fuse_mlp_allreduce_rms = (
             config.model_type == "glm_moe_dsa"
             and vllm_config.parallel_config.pipeline_parallel_size == 1
+            and not self.use_sequence_parallel
         )
         if self.is_v32:
             topk_tokens = config.index_topk
@@ -1490,6 +1507,16 @@ class DeepseekV2Model(nn.Module):
         else:
             llama_4_scaling = None
 
+        full_num_tokens = positions.shape[0]
+        if self.use_sequence_parallel:
+            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                forward_context = get_forward_context()
+                forward_context.is_padding = sp_padding_mask(
+                    forward_context.is_padding, hidden_states
+                )
+            hidden_states = sp_shard(hidden_states)
+            assert residual is None, "Sequence parallelism does not support PP"
+
         aux_hidden_states = []
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
@@ -1497,7 +1524,8 @@ class DeepseekV2Model(nn.Module):
         ):
             # all gather if we need to use the whole states
             if (
-                hidden_states.shape[0] != positions.shape[0]
+                not self.use_sequence_parallel
+                and hidden_states.shape[0] != full_num_tokens
                 and not layer.use_sequence_parallel_moe
             ):
                 combined_states = torch.cat([hidden_states, residual], dim=-1)
@@ -1507,23 +1535,31 @@ class DeepseekV2Model(nn.Module):
                     [self.hidden_size, self.hidden_size], dim=-1
                 )
             if idx in self.aux_hidden_state_layers:
-                aux_hidden_state = hidden_states + residual
-                if aux_hidden_state.shape[0] != positions.shape[0]:
+                aux_hidden_state = (
+                    hidden_states if residual is None else hidden_states + residual
+                )
+                if (
+                    not self.use_sequence_parallel
+                    and aux_hidden_state.shape[0] != full_num_tokens
+                ):
                     aux_hidden_state = tensor_model_parallel_all_gather(
                         aux_hidden_state, 0
                     )
-                    aux_hidden_state = aux_hidden_state[: positions.shape[0]]
+                    aux_hidden_state = aux_hidden_state[:full_num_tokens]
                 aux_hidden_states.append(aux_hidden_state)
             hidden_states, residual = layer(
                 positions, hidden_states, residual, llama_4_scaling
             )
 
         if not get_pp_group().is_last_rank:
+            assert not self.use_sequence_parallel, (
+                "Sequence parallelism does not support PP"
+            )
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        if hidden_states.shape[0] != positions.shape[0]:
+        if not self.use_sequence_parallel and hidden_states.shape[0] != full_num_tokens:
             combined_states = torch.cat([hidden_states, residual], dim=-1)
             combined_states = tensor_model_parallel_all_gather(combined_states, 0)
             combined_states = combined_states[: positions.shape[0]]
@@ -1534,7 +1570,21 @@ class DeepseekV2Model(nn.Module):
         if self.end_layer in self.aux_hidden_state_layers:
             aux_hidden_states.append(hidden_states + residual)
 
-        if self.fuse_mlp_allreduce_rms:
+        if self.use_sequence_parallel:
+            hidden_states, _ = self.norm(hidden_states, residual)
+            if aux_hidden_states:
+                hidden_size = hidden_states.shape[-1]
+                packed_hidden_states = torch.cat(
+                    [hidden_states, *aux_hidden_states], dim=-1
+                )
+                packed_hidden_states = sp_all_gather(packed_hidden_states)
+                packed_hidden_states = packed_hidden_states[:full_num_tokens]
+                hidden_states, *aux_hidden_states = packed_hidden_states.split(
+                    hidden_size, dim=-1
+                )
+            else:
+                hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+        elif self.fuse_mlp_allreduce_rms:
             hidden_states, _ = fused_allreduce_rms_norm(
                 hidden_states, residual, self.norm
             )

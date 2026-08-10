@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_GLM_LEGACY_TP_MOE_SP: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     # Deprecated alias of VLLM_TRITON_USE_TD (removed in v0.25).
     VLLM_TRITON_ATTN_USE_TD: bool | None = None
@@ -1057,6 +1058,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # AsyncLLMEngine errors and stops serving requests
     "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH": lambda: bool(
         int(os.getenv("VLLM_KEEP_ALIVE_ON_ENGINE_DEATH", "0"))
+    ),
+    "VLLM_GLM_LEGACY_TP_MOE_SP": lambda: bool(
+        int(os.getenv("VLLM_GLM_LEGACY_TP_MOE_SP", "0"))
     ),
     # If the env var VLLM_ALLOW_LONG_MAX_MODEL_LEN is set, it allows
     # the user to specify a max sequence length greater than
