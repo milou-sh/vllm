@@ -175,12 +175,14 @@ def _select_low_radix_kernel(
     cutoff_count = tl.load(histogram_ptr + row * histogram_stride + NUM_BINS + low_key)
     cutoff_mass = tl.load(histogram_ptr + row * histogram_stride + low_key)
     unit_mass = cutoff_mass / cutoff_count
-    keep_count = tl.ceil(target / unit_mass).to(tl.int32)
+    mass_within_bin_above = tl.sum(tl.where(descending > low_key, mass, 0.0))
+    cutoff_target = target - mass_within_bin_above
+    keep_count = tl.ceil(cutoff_target / unit_mass).to(tl.int32)
     keep_count = tl.maximum(1, tl.minimum(keep_count, cutoff_count.to(tl.int32)))
     tl.store(cutoff_keep_count_ptr + row, keep_count)
     tl.store(
         retained_mass_ptr + row,
-        tl.load(mass_above_ptr + row) + keep_count * unit_mass,
+        tl.load(mass_above_ptr + row) + mass_within_bin_above + keep_count * unit_mass,
     )
 
 

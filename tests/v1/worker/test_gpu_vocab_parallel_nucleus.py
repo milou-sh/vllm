@@ -69,6 +69,37 @@ def test_radix_cutoff_matches_stable_top_p(num_rows: int, distribution: str):
     )
 
 
+def test_radix_cutoff_counts_only_the_required_tied_tokens():
+    logits = torch.full((1, 256), -float("inf"), device="cuda", dtype=torch.bfloat16)
+    logits[0, 0] = 4.0
+    logits[0, 1:11] = 3.5
+    top_p = torch.tensor([0.3], device="cuda")
+    cutoff = distributed_bf16_top_p_cutoff(
+        logits,
+        top_p,
+        vocab_start=0,
+        org_vocab_size=logits.shape[1],
+        tp_group=None,
+    )
+
+    keys = _ordered_key(logits)
+    token_ids = torch.arange(logits.shape[1], device="cuda")
+    actual = (keys > cutoff.ordered_key.unsqueeze(-1)) | (
+        (keys == cutoff.ordered_key.unsqueeze(-1))
+        & (token_ids.unsqueeze(0) <= cutoff.last_token_id.unsqueeze(-1))
+    )
+    expected = _reference_keep_mask(logits, top_p)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.sum().item() == 3
+
+    expected_mass = (
+        torch.exp(logits.float() - cutoff.global_max.unsqueeze(-1)) * expected
+    ).sum(dim=-1)
+    torch.testing.assert_close(
+        cutoff.retained_mass, expected_mass, rtol=2e-5, atol=2e-5
+    )
+
+
 def test_distributed_candidates_match_full_vocab_gumbel():
     torch.manual_seed(19)
     num_rows = 12
