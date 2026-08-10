@@ -7,10 +7,12 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import tensor_model_parallel_all_gather
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -30,6 +32,11 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.models.common.ops.fused_allreduce_rms_norm import (
     fused_allreduce_rms_norm,
+)
+from vllm.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_padding_mask,
+    sp_shard,
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -117,16 +124,33 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         inputs_embeds = self.enorm(inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
 
-        hidden_states = self.eh_proj(
-            torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
-        )
+        eh_input = torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
+        is_sequence_parallel = self.mtp_block.use_sequence_parallel
+        if is_sequence_parallel:
+            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                forward_context = get_forward_context()
+                forward_context.is_padding = sp_padding_mask(
+                    forward_context.is_padding, eh_input
+                )
+            eh_input = sp_shard(eh_input)
+        hidden_states = self.eh_proj(eh_input)
 
         hidden_states, residual = self.mtp_block(
             positions=positions,
             hidden_states=hidden_states,
             residual=None,
         )
-        if self.mtp_block.fuse_attention_allreduce_rms:
+        if is_sequence_parallel:
+            pre_norm_hidden_states = residual + hidden_states
+            normalized_hidden_states = self.shared_head(pre_norm_hidden_states)
+            hidden_size = pre_norm_hidden_states.shape[-1]
+            packed_hidden_states = sp_all_gather(
+                torch.cat([pre_norm_hidden_states, normalized_hidden_states], dim=-1)
+            )[: positions.shape[0]]
+            hidden_states, normalized_hidden_states = packed_hidden_states.split(
+                hidden_size, dim=-1
+            )
+        elif self.mtp_block.fuse_attention_allreduce_rms:
             normalized_hidden_states, hidden_states = fused_allreduce_rms_norm(
                 hidden_states, residual, self.shared_head.norm
             )
