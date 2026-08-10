@@ -33,6 +33,8 @@ def test_glm_fused_a_is_opt_in_on_sm90(monkeypatch) -> None:
     monkeypatch.setattr(envs, "VLLM_GLM52_SM90_FUSED_A_GEMM", True)
     assert deepseek_v2._supports_min_latency_fused_qkv_a(_weight(2624, 6144))
     assert deepseek_v2._supports_min_latency_fused_qkv_a(_weight(8192, 2048))
+    assert deepseek_v2._supports_min_latency_fused_qkv_a(_weight(14336, 512))
+    assert deepseek_v2._supports_min_latency_fused_qkv_a(_weight(6144, 8192))
     assert deepseek_v2._min_latency_fused_a_max_tokens(_weight(2624, 6144)) == 64
     assert not deepseek_v2._supports_min_latency_fused_qkv_a(_weight(2625, 6144))
     assert not deepseek_v2._supports_min_latency_fused_qkv_a(
@@ -74,16 +76,16 @@ def test_q_b_swap_requires_exact_unquantized_shape(monkeypatch) -> None:
     monkeypatch.setattr(envs, "VLLM_GLM52_SM90_FUSED_A_GEMM", True)
 
     layer = FakeLinear((8192, 2048), deepseek_v2.UnquantizedLinearMethod())
-    deepseek_v2._enable_glm52_sm90_q_b_fused_a(layer)
+    deepseek_v2._enable_glm52_sm90_fused_a(layer)
     assert isinstance(layer.quant_method, deepseek_v2.Glm52SM90FusedALinearMethod)
 
     quantized_method = object()
     quantized = FakeLinear((8192, 2048), quantized_method)
-    deepseek_v2._enable_glm52_sm90_q_b_fused_a(quantized)
+    deepseek_v2._enable_glm52_sm90_fused_a(quantized)
     assert quantized.quant_method is quantized_method
 
     wrong_shape = FakeLinear((2048, 2048), deepseek_v2.UnquantizedLinearMethod())
-    deepseek_v2._enable_glm52_sm90_q_b_fused_a(wrong_shape)
+    deepseek_v2._enable_glm52_sm90_fused_a(wrong_shape)
     assert type(wrong_shape.quant_method) is deepseek_v2.UnquantizedLinearMethod
 
 
@@ -93,5 +95,7 @@ def test_tp4_q_b_kernel_shape_is_instantiated() -> None:
         / "csrc/libtorch_stable/dsv3_fused_a_gemm.cu"
     ).read_text()
     assert "DISPATCH_DSV3_SHAPE(2048, 8192)" in source
+    assert "DISPATCH_DSV3_SHAPE(512, 14336)" in source
+    assert "DISPATCH_DSV3_SHAPE(8192, 6144)" in source
     assert "gemm_n - cta_n_idx" in source
     assert "num_tokens <= 64" in source

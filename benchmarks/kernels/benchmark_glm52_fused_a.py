@@ -17,6 +17,8 @@ os.environ.setdefault("VLLM_GLM52_SM90_FUSED_A_GEMM", "1")
 PROJECTIONS = {
     "fused_qkv_a_proj": (6144, 2624),
     "q_b_proj_tp4": (2048, 8192),
+    "kv_b_proj_tp4": (512, 14336),
+    "o_proj_tp4": (8192, 6144),
 }
 
 

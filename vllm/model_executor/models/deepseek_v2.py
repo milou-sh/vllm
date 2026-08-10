@@ -875,7 +875,12 @@ def _try_load_fp8_indexer_wk(
     return True
 
 
-_GLM52_SM90_FUSED_A_SHAPES = ((2624, 6144), (8192, 2048))
+_GLM52_SM90_FUSED_A_SHAPES = (
+    (2624, 6144),
+    (8192, 2048),
+    (14336, 512),
+    (6144, 8192),
+)
 
 
 def _min_latency_fused_a_max_tokens(weight: torch.Tensor) -> int:
@@ -954,11 +959,11 @@ class Glm52SM90FusedALinearMethod(UnquantizedLinearMethod):
         return super().apply(layer, x, bias)
 
 
-def _enable_glm52_sm90_q_b_fused_a(layer: nn.Module) -> None:
+def _enable_glm52_sm90_fused_a(layer: nn.Module) -> None:
     weight = getattr(layer, "weight", None)
     if (
         weight is not None
-        and tuple(weight.shape) == (8192, 2048)
+        and tuple(weight.shape) in _GLM52_SM90_FUSED_A_SHAPES
         and _supports_min_latency_fused_qkv_a(weight)
         and type(layer.quant_method) is UnquantizedLinearMethod
     ):
@@ -1086,7 +1091,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_b_proj",
             )
-            _enable_glm52_sm90_q_b_fused_a(self.q_b_proj)
+            _enable_glm52_sm90_fused_a(self.q_b_proj)
         else:
             self.q_proj = q_proj_cls(
                 proj_input_size,
@@ -1103,6 +1108,7 @@ class DeepseekV2MLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
         )
+        _enable_glm52_sm90_fused_a(self.kv_b_proj)
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
@@ -1111,6 +1117,7 @@ class DeepseekV2MLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        _enable_glm52_sm90_fused_a(self.o_proj)
 
         if config.rope_parameters["rope_type"] != "default":
             config.rope_parameters["rope_type"] = (
