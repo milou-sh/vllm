@@ -12,6 +12,14 @@ from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 # available — on the CPU worker path `tl` is a placeholder whose `constexpr`
 # attribute is `None`, and `tl.constexpr(...)` would crash at import time.
 _TL_RAND_MIN = tl.constexpr(4.6566127342e-10) if HAS_TRITON else 4.6566127342e-10
+_FP32_ONE_MINUS_EPS = (
+    tl.constexpr(float.fromhex("0x1.fffffep-1"))
+    if HAS_TRITON
+    else float.fromhex("0x1.fffffep-1")
+)
+_FP64_ONE_MINUS_EPS = (
+    tl.constexpr(0.9999999999999999) if HAS_TRITON else 0.9999999999999999
+)
 
 
 @triton.jit
@@ -69,7 +77,7 @@ def tl_rand64(seed, offset, includes_zero: tl.constexpr):
     scale = 5.421010862427522170037e-20
     u = r.to(tl.float64) * scale
     if not includes_zero:
-        u = tl.maximum(u, 2.2250738585072014e-308)  # float64 tiny
+        u = tl.minimum(tl.maximum(u, 2.2250738585072014e-308), _FP64_ONE_MINUS_EPS)
     return u
 
 
@@ -77,7 +85,7 @@ def tl_rand64(seed, offset, includes_zero: tl.constexpr):
 def tl_rand32(seed, offset, includes_zero: tl.constexpr):
     u = tl.rand(seed, offset)
     if not includes_zero:
-        u = tl.maximum(u, _TL_RAND_MIN)
+        u = tl.minimum(tl.maximum(u, _TL_RAND_MIN), _FP32_ONE_MINUS_EPS)
     return u
 
 
@@ -152,7 +160,8 @@ def gumbel_block_argmax(
             gumbel_noise = -tl.log(-tldevice.log1p(-u))
 
         # Apply gumbel noise.
-        logits = tl.where(mask, logits + gumbel_noise, float("-inf"))
+        finite = logits > float("-inf")
+        logits = tl.where(mask & finite, logits + gumbel_noise, float("-inf"))
 
     value, idx = tl.max(logits, axis=0, return_indices=True)
     return value, idx
