@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from vllm.distributed import cleanup_dist_env_and_memory, get_tp_group
 from vllm.distributed.parallel_state import (
+    graph_capture,
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
@@ -28,12 +29,12 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sam
 def _time_ms(fn, warmup: int, iterations: int) -> tuple[list[float], list[float]]:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     cuda_timings = []
     wall_timings = []
     for _ in range(iterations):
         dist.barrier()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         wall_start = time.perf_counter()
@@ -44,6 +45,17 @@ def _time_ms(fn, warmup: int, iterations: int) -> tuple[list[float], list[float]
         wall_timings.append((time.perf_counter() - wall_start) * 1000)
         cuda_timings.append(start.elapsed_time(end))
     return cuda_timings, wall_timings
+
+
+def _capture_cuda_graph(
+    fn, device: torch.device
+) -> tuple[torch.cuda.CUDAGraph, object]:
+    with graph_capture(device=device):
+        fn()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = fn()
+    return graph, output
 
 
 def _ordered_bf16_key(logits: torch.Tensor) -> torch.Tensor:
@@ -104,13 +116,14 @@ def main():
     parser.add_argument("--seed", type=int, default=20260810)
     parser.add_argument("--logits-file")
     parser.add_argument("--measure-lm-head", action="store_true")
+    parser.add_argument("--measure-cudagraph", action="store_true")
     parser.add_argument("--require-output-equality", action="store_true")
     args = parser.parse_args()
     if args.distribution == "masked" and not 0 < args.valid_vocab <= args.vocab_size:
         raise ValueError("valid-vocab must be in [1, vocab-size]")
 
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     set_custom_all_reduce(False)
     init_distributed_environment()
     initialize_model_parallel(tensor_model_parallel_size=dist.get_world_size())
@@ -269,6 +282,21 @@ def main():
         distributed_path, args.warmup, args.iterations
     )
     full_cuda_ms, full_wall_ms = _time_ms(full_path, args.warmup, args.iterations)
+    distributed_graph_cuda_ms = None
+    distributed_graph_wall_ms = None
+    full_graph_cuda_ms = None
+    full_graph_wall_ms = None
+    if args.measure_cudagraph:
+        distributed_graph, _distributed_graph_output = _capture_cuda_graph(
+            distributed_path, device
+        )
+        full_graph, _full_graph_output = _capture_cuda_graph(full_path, device)
+        distributed_graph_cuda_ms, distributed_graph_wall_ms = _time_ms(
+            distributed_graph.replay, args.warmup, args.iterations
+        )
+        full_graph_cuda_ms, full_graph_wall_ms = _time_ms(
+            full_graph.replay, args.warmup, args.iterations
+        )
     lm_head_cuda_ms = None
     lm_head_wall_ms = None
     if args.measure_lm_head:
@@ -300,6 +328,22 @@ def main():
         lm_head_wall_median = (
             statistics.median(lm_head_wall_ms) if lm_head_wall_ms else None
         )
+        distributed_graph_cuda_median = (
+            statistics.median(distributed_graph_cuda_ms)
+            if distributed_graph_cuda_ms
+            else None
+        )
+        distributed_graph_wall_median = (
+            statistics.median(distributed_graph_wall_ms)
+            if distributed_graph_wall_ms
+            else None
+        )
+        full_graph_cuda_median = (
+            statistics.median(full_graph_cuda_ms) if full_graph_cuda_ms else None
+        )
+        full_graph_wall_median = (
+            statistics.median(full_graph_wall_ms) if full_graph_wall_ms else None
+        )
         print(
             json.dumps(
                 {
@@ -326,6 +370,20 @@ def main():
                     "full_wall_median_ms": full_wall_median,
                     "cuda_speedup": full_cuda_median / distributed_cuda_median,
                     "wall_speedup": full_wall_median / distributed_wall_median,
+                    "distributed_graph_cuda_median_ms": (distributed_graph_cuda_median),
+                    "distributed_graph_wall_median_ms": (distributed_graph_wall_median),
+                    "distributed_graph_cuda_speedup": (
+                        distributed_cuda_median / distributed_graph_cuda_median
+                        if distributed_graph_cuda_median is not None
+                        else None
+                    ),
+                    "distributed_graph_wall_speedup": (
+                        distributed_wall_median / distributed_graph_wall_median
+                        if distributed_graph_wall_median is not None
+                        else None
+                    ),
+                    "full_graph_cuda_median_ms": full_graph_cuda_median,
+                    "full_graph_wall_median_ms": full_graph_wall_median,
                     "lm_head_cuda_median_ms": lm_head_cuda_median,
                     "lm_head_wall_median_ms": lm_head_wall_median,
                     "pipeline_cuda_speedup": (
