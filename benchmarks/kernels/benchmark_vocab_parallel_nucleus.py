@@ -61,6 +61,29 @@ def _stable_top_p_mask(logits: torch.Tensor, top_p: torch.Tensor) -> torch.Tenso
     return torch.zeros_like(sorted_keep).scatter(-1, order, sorted_keep)
 
 
+def _make_logits(args, num_rows: int, device: torch.device) -> torch.Tensor:
+    if args.distribution == "captured":
+        if args.logits_file is None:
+            raise ValueError("--logits-file is required for captured logits")
+        captured = torch.load(args.logits_file, map_location="cpu", weights_only=True)
+        if isinstance(captured, dict):
+            captured = captured.get("logits")
+        if not isinstance(captured, torch.Tensor) or captured.ndim != 2:
+            raise ValueError("captured logits must be a tensor shaped [rows, vocab]")
+        if captured.shape[0] < num_rows or captured.shape[1] != args.vocab_size:
+            raise ValueError(
+                f"captured logits shape {tuple(captured.shape)} cannot provide "
+                f"({num_rows}, {args.vocab_size})"
+            )
+        return captured[:num_rows].to(device=device, dtype=torch.bfloat16)
+
+    logits = torch.randn(num_rows, args.vocab_size, dtype=torch.bfloat16, device=device)
+    if args.distribution == "peaked":
+        logits[:, 0] += 13.0
+        logits[:, 1:8] += 8.0
+    return logits
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-requests", type=int, default=10)
@@ -70,6 +93,10 @@ def main():
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument(
+        "--distribution", choices=("normal", "peaked", "captured"), default="normal"
+    )
+    parser.add_argument("--logits-file")
     parser.add_argument("--measure-lm-head", action="store_true")
     parser.add_argument("--require-output-equality", action="store_true")
     args = parser.parse_args()
@@ -91,9 +118,7 @@ def main():
     local_vocab = args.vocab_size // world_size
     vocab_start = rank * local_vocab
     torch.manual_seed(20260810)
-    global_logits = torch.randn(
-        num_rows, args.vocab_size, dtype=torch.bfloat16, device=device
-    )
+    global_logits = _make_logits(args, num_rows, device)
     local_logits = global_logits[
         :, vocab_start : vocab_start + local_vocab
     ].contiguous()
@@ -275,6 +300,8 @@ def main():
                     "num_rows": num_rows,
                     "vocab_size": args.vocab_size,
                     "top_p": args.top_p,
+                    "distribution": args.distribution,
+                    "logits_file": args.logits_file,
                     "allreduce_flashinfer": os.getenv(
                         "VLLM_ALLREDUCE_USE_FLASHINFER", "0"
                     ),

@@ -33,10 +33,16 @@ def _reference_keep_mask(logits: torch.Tensor, top_p: torch.Tensor) -> torch.Ten
 
 
 @pytest.mark.parametrize("num_rows", [1, 8, 40])
-def test_radix_cutoff_matches_stable_top_p(num_rows: int):
+@pytest.mark.parametrize("distribution", ["normal", "peaked", "masked"])
+def test_radix_cutoff_matches_stable_top_p(num_rows: int, distribution: str):
     torch.manual_seed(11)
     vocab_size = 4096
     logits = torch.randn(num_rows, vocab_size, device="cuda", dtype=torch.bfloat16)
+    if distribution == "peaked":
+        logits[:, 0] += 13.0
+        logits[:, 1:8] += 8.0
+    elif distribution == "masked":
+        logits[:, 512:] = -float("inf")
     top_p = torch.linspace(0.8, 0.99, num_rows, device="cuda")
     cutoff = distributed_bf16_top_p_cutoff(
         logits,

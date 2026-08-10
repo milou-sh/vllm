@@ -67,8 +67,13 @@ def _radix_high_histogram_kernel(
         mask=mask,
         other=-float("inf"),
     )
+    mask &= logits != -float("inf")
     keys = _ordered_bf16_key(logits)
-    weights = tl.exp(logits.to(tl.float32) - tl.load(local_max_ptr + row))
+    weights = tl.where(
+        mask,
+        tl.exp(logits.to(tl.float32) - tl.load(local_max_ptr + row)),
+        0.0,
+    )
     tl.atomic_add(
         histogram_ptr + row * histogram_stride + (keys >> 8),
         weights,
@@ -123,9 +128,14 @@ def _radix_low_histogram_kernel(
         mask=mask,
         other=-float("inf"),
     )
+    mask &= logits != -float("inf")
     keys = _ordered_bf16_key(logits)
     mask &= (keys >> 8) == tl.load(high_key_ptr + row)
-    weights = tl.exp(logits.to(tl.float32) - tl.load(local_max_ptr + row))
+    weights = tl.where(
+        mask,
+        tl.exp(logits.to(tl.float32) - tl.load(local_max_ptr + row)),
+        0.0,
+    )
     tl.atomic_add(
         histogram_ptr + row * histogram_stride + (keys & 0xFF),
         weights,
@@ -515,6 +525,7 @@ def distributed_bf16_top_p_cutoff(
 
     num_rows, local_vocab_size = local_logits.shape
     local_max = local_logits.amax(dim=-1).float()
+    histogram_max = torch.where(torch.isfinite(local_max), local_max, 0.0)
     histogram = torch.zeros(
         (num_rows, _NUM_RADIX_BINS), dtype=torch.float32, device=local_logits.device
     )
@@ -525,7 +536,7 @@ def distributed_bf16_top_p_cutoff(
         local_logits.stride(0),
         histogram,
         histogram.stride(0),
-        local_max,
+        histogram_max,
         local_vocab_size,
         vocab_start,
         org_vocab_size,
@@ -559,7 +570,7 @@ def distributed_bf16_top_p_cutoff(
         local_logits.stride(0),
         histogram,
         histogram.stride(0),
-        local_max,
+        histogram_max,
         high_key,
         local_vocab_size,
         vocab_start,
