@@ -280,6 +280,9 @@ if TYPE_CHECKING:
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_GLM52_DISTRIBUTED_NUCLEUS: bool = False
+    VLLM_GLM52_NUCLEUS_CAPTURE_DIR: str | None = None
+    VLLM_GLM52_NUCLEUS_CAPTURE_EVERY: int = 100
+    VLLM_GLM52_NUCLEUS_CAPTURE_LIMIT: int = 0
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -1975,6 +1978,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM52_DISTRIBUTED_NUCLEUS": lambda: bool(
         int(os.getenv("VLLM_GLM52_DISTRIBUTED_NUCLEUS", "0"))
+    ),
+    "VLLM_GLM52_NUCLEUS_CAPTURE_DIR": lambda: os.getenv(
+        "VLLM_GLM52_NUCLEUS_CAPTURE_DIR"
+    ),
+    "VLLM_GLM52_NUCLEUS_CAPTURE_EVERY": lambda: int(
+        os.getenv("VLLM_GLM52_NUCLEUS_CAPTURE_EVERY", "100")
+    ),
+    "VLLM_GLM52_NUCLEUS_CAPTURE_LIMIT": lambda: int(
+        os.getenv("VLLM_GLM52_NUCLEUS_CAPTURE_LIMIT", "0")
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model

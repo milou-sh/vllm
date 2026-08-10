@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterator
+from pathlib import Path
 
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.distributed import get_tp_group
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
@@ -27,6 +30,8 @@ from vllm.v1.worker.gpu.sample.vocab_parallel_nucleus import (
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
+
+logger = init_logger(__name__)
 
 # Cap on the FP32 target-logits buffer materialized by apply_sampling_params.
 # TODO(mgoin): Chunking is a workaround. The rejection kernels already upcast
@@ -95,6 +100,54 @@ class RejectionSampler:
             )
         elif rejection_sample_method == "block":
             self.use_block_verification = True
+        self._nucleus_capture_step = 0
+        self._nucleus_capture_count = 0
+
+    def _capture_nucleus_logits(
+        self,
+        local_logits: torch.Tensor,
+        top_p: torch.Tensor,
+        positions: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        vocab_size: int,
+    ) -> None:
+        step = self._nucleus_capture_step
+        self._nucleus_capture_step += 1
+        capture_dir = envs.VLLM_GLM52_NUCLEUS_CAPTURE_DIR
+        capture_limit = envs.VLLM_GLM52_NUCLEUS_CAPTURE_LIMIT
+        capture_every = envs.VLLM_GLM52_NUCLEUS_CAPTURE_EVERY
+        if (
+            capture_dir is None
+            or capture_limit <= self._nucleus_capture_count
+            or capture_every <= 0
+            or step % capture_every != 0
+        ):
+            return
+
+        tp_group = get_tp_group()
+        logits = tp_group.all_gather(local_logits, dim=-1)[:, :vocab_size]
+        capture_index = self._nucleus_capture_count
+        self._nucleus_capture_count += 1
+        if tp_group.rank_in_group != 0:
+            return
+
+        directory = Path(capture_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        output_path = directory / (
+            f"target-logits-{capture_index:03d}-step-{step:08d}.pt"
+        )
+        torch.save(
+            {
+                "logits": logits.detach().cpu(),
+                "top_p": top_p.detach().cpu(),
+                "positions": positions.detach().cpu(),
+                "cu_num_logits": cu_num_logits.detach().cpu(),
+                "vocab_size": vocab_size,
+                "step": step,
+            },
+            output_path,
+        )
+        logger.info("Captured GLM target logits to %s", output_path)
 
     def can_vocab_parallel_nucleus(
         self,
@@ -152,6 +205,13 @@ class RejectionSampler:
         )
         states = self.sampler.sampling_states
         top_p = states.top_p.gpu[input_batch.expanded_idx_mapping]
+        self._capture_nucleus_logits(
+            local_logits,
+            top_p,
+            pos,
+            input_batch.cu_num_logits,
+            states.vocab_size,
+        )
         tp_group = get_tp_group()
         cutoff = distributed_bf16_top_p_cutoff(
             local_logits,
