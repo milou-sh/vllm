@@ -335,3 +335,27 @@ template void invokeRouterGemmBf16Output<__nv_bfloat16, 15, 256, 6144>(
 
 template void invokeRouterGemmBf16Output<__nv_bfloat16, 16, 256, 6144>(
     __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+#define INSTANTIATE_GLM52_BF16(M)                                     \
+  template void invokeRouterGemmBf16Output<__nv_bfloat16, M, 168, 6144>( \
+      __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*,      \
+      cudaStream_t);
+
+INSTANTIATE_GLM52_BF16(1)
+INSTANTIATE_GLM52_BF16(2)
+INSTANTIATE_GLM52_BF16(3)
+INSTANTIATE_GLM52_BF16(4)
+INSTANTIATE_GLM52_BF16(5)
+INSTANTIATE_GLM52_BF16(6)
+INSTANTIATE_GLM52_BF16(7)
+INSTANTIATE_GLM52_BF16(8)
+INSTANTIATE_GLM52_BF16(9)
+INSTANTIATE_GLM52_BF16(10)
+INSTANTIATE_GLM52_BF16(11)
+INSTANTIATE_GLM52_BF16(12)
+INSTANTIATE_GLM52_BF16(13)
+INSTANTIATE_GLM52_BF16(14)
+INSTANTIATE_GLM52_BF16(15)
+INSTANTIATE_GLM52_BF16(16)
+
+#undef INSTANTIATE_GLM52_BF16

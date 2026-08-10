@@ -39,6 +39,7 @@ inline int getSMVersion() {
 }  // namespace
 
 static constexpr int DEFAULT_NUM_EXPERTS = 256;
+static constexpr int GLM_52_NUM_EXPERTS = 168;
 static constexpr int KIMI_K2_NUM_EXPERTS = 384;
 static constexpr int DEFAULT_HIDDEN_DIM = 7168;
 static constexpr int GLM_5_HIDDEN_DIM = 6144;
@@ -126,17 +127,15 @@ void dsv3_router_gemm(
       hidden_dim == DEFAULT_HIDDEN_DIM || hidden_dim == GLM_5_HIDDEN_DIM,
       "Expected hidden_dim=", DEFAULT_HIDDEN_DIM,
       " or hidden_dim=", GLM_5_HIDDEN_DIM, ", but got hidden_dim=", hidden_dim);
-  STD_TORCH_CHECK(
-      num_experts == DEFAULT_NUM_EXPERTS || num_experts == KIMI_K2_NUM_EXPERTS,
-      "Expected num_experts=", DEFAULT_NUM_EXPERTS,
-      " or num_experts=", KIMI_K2_NUM_EXPERTS,
-      ", but got num_experts=", num_experts);
-  // KIMI_K2_NUM_EXPERTS is only instantiated for the default hidden_dim.
-  STD_TORCH_CHECK(
-      hidden_dim == DEFAULT_HIDDEN_DIM || num_experts == DEFAULT_NUM_EXPERTS,
-      "hidden_dim=", GLM_5_HIDDEN_DIM,
-      " only supports num_experts=", DEFAULT_NUM_EXPERTS,
-      ", but got num_experts=", num_experts);
+  const bool supported_shape =
+      (hidden_dim == DEFAULT_HIDDEN_DIM &&
+       (num_experts == DEFAULT_NUM_EXPERTS ||
+        num_experts == KIMI_K2_NUM_EXPERTS)) ||
+      (hidden_dim == GLM_5_HIDDEN_DIM &&
+       (num_experts == GLM_52_NUM_EXPERTS ||
+        num_experts == DEFAULT_NUM_EXPERTS));
+  STD_TORCH_CHECK(supported_shape, "Unsupported (hidden_dim, num_experts)=",
+                  "(", hidden_dim, ", ", num_experts, ")");
   STD_TORCH_CHECK(num_tokens >= 1 && num_tokens <= 16,
                   "currently num_tokens must be less than or equal to 16 for "
                   "router_gemm");
@@ -177,7 +176,11 @@ void dsv3_router_gemm(
                                                               out_ptr, a_ptr,
                                                               b_ptr, stream);
       }
-    } else {  // GLM_5_HIDDEN_DIM
+    } else if (num_experts == GLM_52_NUM_EXPERTS) {
+      LoopUnroller<1, 16, GLM_52_NUM_EXPERTS,
+                   GLM_5_HIDDEN_DIM>::unroll_float_output(num_tokens, out_ptr,
+                                                          a_ptr, b_ptr, stream);
+    } else {
       LoopUnroller<1, 16, DEFAULT_NUM_EXPERTS,
                    GLM_5_HIDDEN_DIM>::unroll_float_output(num_tokens, out_ptr,
                                                           a_ptr, b_ptr, stream);
@@ -197,7 +200,11 @@ void dsv3_router_gemm(
                                                              out_ptr, a_ptr,
                                                              b_ptr, stream);
       }
-    } else {  // GLM_5_HIDDEN_DIM
+    } else if (num_experts == GLM_52_NUM_EXPERTS) {
+      LoopUnroller<1, 16, GLM_52_NUM_EXPERTS,
+                   GLM_5_HIDDEN_DIM>::unroll_bf16_output(num_tokens, out_ptr,
+                                                         a_ptr, b_ptr, stream);
+    } else {
       LoopUnroller<1, 16, DEFAULT_NUM_EXPERTS,
                    GLM_5_HIDDEN_DIM>::unroll_bf16_output(num_tokens, out_ptr,
                                                          a_ptr, b_ptr, stream);

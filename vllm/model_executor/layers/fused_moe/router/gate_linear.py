@@ -20,7 +20,8 @@ class GateLinear(ReplicatedLinear):
 
     1. cuteDSL ll_bf16_gemm (SM90+, M<=16, bf16 in, fp32 out,
        K divisible by 8)
-    2. DSV3 specialized kernel (SM90+, M<=16, H=7168 E=256/384, H=6144 E=256)
+    2. DSV3 specialized kernel (SM90+, M<=16, H=7168 E=256/384,
+       H=6144 E=168/256)
     3. fp32 specialized kernel  (SM90+, bf16/fp32 in, fp32 out, M<=32,
        (H, E) in {(3072, 256), (6144, 128), (6144, 256)})
     4. experimental bf16x3 CuteDSL kernel (opt-in, SM100, bf16 in, fp32 weight)
@@ -36,10 +37,9 @@ class GateLinear(ReplicatedLinear):
     # Valid (hidden_size, num_experts) combinations:
     #   (7168, 256) -> DeepSeek-V3,  (7168, 384) -> Kimi-K2,
     #   (6144, 256) -> GLM-5
-    DSV3_SUPPORTED_NUM_EXPERTS = [256, 384]
+    DSV3_SUPPORTED_NUM_EXPERTS = [168, 256, 384]
     DSV3_SUPPORTED_HIDDEN_SIZES = [7168, 6144]
-    # num_experts=384 is only instantiated for hidden_size=7168.
-    DSV3_UNSUPPORTED_SHAPES = {(6144, 384)}
+    DSV3_UNSUPPORTED_SHAPES = {(7168, 168), (6144, 384)}
 
     # (hidden_size, num_experts) pairs with an instantiated fp32 kernel:
     #   (3072, 256) -> MiniMax-M2/M2.5,  (6144, 128) -> MiniMax-M3
