@@ -46,6 +46,21 @@ def _time_ms(fn, warmup: int, iterations: int) -> tuple[list[float], list[float]
     return cuda_timings, wall_timings
 
 
+def _ordered_bf16_key(logits: torch.Tensor) -> torch.Tensor:
+    bits = logits.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+    return torch.where((bits & 0x8000) != 0, (~bits) & 0xFFFF, bits ^ 0x8000)
+
+
+def _stable_top_p_mask(logits: torch.Tensor, top_p: torch.Tensor) -> torch.Tensor:
+    order = torch.argsort(logits.float(), dim=-1, descending=True, stable=True)
+    probs = logits.float().softmax(dim=-1)
+    cumulative = probs.gather(-1, order).cumsum(dim=-1)
+    counts = (cumulative < top_p.unsqueeze(-1)).sum(dim=-1) + 1
+    positions = torch.arange(logits.shape[-1], device=logits.device)
+    sorted_keep = positions.unsqueeze(0) < counts.unsqueeze(-1)
+    return torch.zeros_like(sorted_keep).scatter(-1, order, sorted_keep)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-requests", type=int, default=10)
@@ -56,6 +71,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--measure-lm-head", action="store_true")
+    parser.add_argument("--require-output-equality", action="store_true")
     args = parser.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -160,16 +176,61 @@ def main():
             args.speculative_steps,
         )
 
+    initial_cutoff = distributed_bf16_top_p_cutoff(
+        local_logits,
+        top_p,
+        vocab_start=vocab_start,
+        org_vocab_size=args.vocab_size,
+        tp_group=tp_group,
+    )
+    local_tokens = torch.arange(local_vocab, device=device) + vocab_start
+    local_keys = _ordered_bf16_key(local_logits)
+    local_keep = (local_keys > initial_cutoff.ordered_key.unsqueeze(-1)) | (
+        (local_keys == initial_cutoff.ordered_key.unsqueeze(-1))
+        & (local_tokens.unsqueeze(0) <= initial_cutoff.last_token_id.unsqueeze(-1))
+    )
+    distributed_keep = tp_group.all_gather(local_keep.to(torch.uint8), dim=-1).bool()
+    full_logits = tp_group.all_gather(local_logits, dim=-1)
+    stable_keep = _stable_top_p_mask(full_logits, top_p)
+    torch.testing.assert_close(distributed_keep, stable_keep, rtol=0, atol=0)
+    expected_retained_mass = (
+        torch.exp(full_logits.float() - initial_cutoff.global_max.unsqueeze(-1))
+        * stable_keep
+    ).sum(dim=-1)
+    retained_mass_relative_error = (
+        (initial_cutoff.retained_mass - expected_retained_mass).abs()
+        / expected_retained_mass
+    ).amax()
+
+    triton_logits = full_logits.float()
+    apply_top_k_top_p(triton_logits, None, top_p)
+    triton_keep = torch.isfinite(triton_logits)
+    triton_mask_agreement = (triton_keep == stable_keep).float().mean()
+    triton_rows_exact = (triton_keep == stable_keep).all(dim=-1).float().mean()
+    del full_logits, triton_logits
+
     distributed_output = distributed_path()
     full_sampled, full_num_sampled = full_path()
-    torch.testing.assert_close(
-        distributed_output.num_sampled, full_num_sampled, rtol=0, atol=0
+    counts_equal = torch.equal(distributed_output.num_sampled, full_num_sampled)
+    steps = torch.arange(args.speculative_steps + 1, device=device).unsqueeze(0)
+    common_valid = steps < torch.minimum(
+        distributed_output.num_sampled, full_num_sampled
+    ).unsqueeze(1)
+    comparable_tokens = int(common_valid.sum().item())
+    matching_tokens = int(
+        (distributed_output.sampled[common_valid] == full_sampled[common_valid])
+        .sum()
+        .item()
     )
-    steps = torch.arange(args.speculative_steps + 1, device=device)
-    valid = steps.unsqueeze(0) < full_num_sampled.unsqueeze(1)
-    torch.testing.assert_close(
-        distributed_output.sampled[valid], full_sampled[valid], rtol=0, atol=0
+    output_token_agreement = (
+        matching_tokens / comparable_tokens if comparable_tokens else 1.0
     )
+    outputs_equal = counts_equal and matching_tokens == comparable_tokens
+    if args.require_output_equality and not outputs_equal:
+        raise AssertionError(
+            "Distributed stable top-p output differs from the current Triton "
+            "top-p output; inspect the reported agreement metrics."
+        )
 
     distributed_cuda_ms, distributed_wall_ms = _time_ms(
         distributed_path, args.warmup, args.iterations
@@ -240,7 +301,17 @@ def main():
                         if lm_head_wall_median is not None
                         else None
                     ),
-                    "outputs_equal": True,
+                    "stable_mask_exact": True,
+                    "retained_mass_max_relative_error": float(
+                        retained_mass_relative_error.item()
+                    ),
+                    "triton_mask_element_agreement": float(
+                        triton_mask_agreement.item()
+                    ),
+                    "triton_mask_rows_exact_fraction": float(triton_rows_exact.item()),
+                    "output_counts_equal": counts_equal,
+                    "output_token_agreement": output_token_agreement,
+                    "outputs_equal": outputs_equal,
                 },
                 sort_keys=True,
             )
