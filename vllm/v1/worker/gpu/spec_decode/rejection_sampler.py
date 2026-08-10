@@ -10,16 +10,20 @@ from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.distributed import get_tp_group
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     get_num_sampled_and_rejected,
 )
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
+from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
+from vllm.v1.worker.gpu.sample.min_p import apply_min_p
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+from vllm.v1.worker.gpu.sample.thinking_budget import apply_thinking_budget
 from vllm.v1.worker.gpu.sample.vocab_parallel_nucleus import (
     distributed_bf16_top_p_cutoff,
     distributed_one_hot_rejection_sample,
@@ -187,6 +191,74 @@ class RejectionSampler:
             num_nans=None,
             num_sampled=num_sampled,
             num_rejected=num_rejected,
+        )
+
+    def forward_vocab_parallel_graph(
+        self,
+        local_logits: torch.Tensor,
+        vocab_start: int,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        logits_indices: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+        top_p: torch.Tensor,
+        seeds: torch.Tensor,
+    ) -> SamplerOutput:
+        if local_logits.dtype != torch.bfloat16:
+            raise ValueError("Distributed nucleus sampling requires BF16 logits.")
+
+        draft_sampled = input_ids[logits_indices]
+        pos = positions[logits_indices]
+        thinking_budget = self.sampler.thinking_budget_state
+        if thinking_budget.enabled:
+            apply_thinking_budget(
+                local_logits,
+                idx_mapping,
+                expanded_idx_mapping,
+                thinking_budget.thinking_token_budget.gpu,
+                thinking_budget.req_states.all_token_ids.gpu,
+                thinking_budget.req_states.total_len.gpu,
+                draft_sampled,
+                expanded_local_pos,
+                thinking_budget.cached_last_start,
+                thinking_budget.cached_last_end,
+                thinking_budget.cached_scan_pos,
+                thinking_budget.reasoning_start_token_ids,
+                thinking_budget.natural_reasoning_end_token_ids,
+                thinking_budget.reasoning_end_token_ids,
+                vocab_start,
+            )
+
+        states = self.sampler.sampling_states
+        cutoff = distributed_bf16_top_p_cutoff(
+            local_logits,
+            top_p[expanded_idx_mapping],
+            vocab_start=vocab_start,
+            org_vocab_size=states.vocab_size,
+            tp_group=get_tp_group(),
+        )
+        output = distributed_one_hot_rejection_sample(
+            local_logits,
+            cutoff,
+            draft_sampled,
+            cu_num_logits,
+            idx_mapping,
+            expanded_idx_mapping,
+            seeds,
+            pos,
+            self.num_speculative_steps,
+            vocab_start=vocab_start,
+            org_vocab_size=states.vocab_size,
+            tp_group=get_tp_group(),
+        )
+        return SamplerOutput(
+            sampled_token_ids=output.sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=output.num_sampled,
         )
 
     def _get_logprobs_tensors(
@@ -369,4 +441,77 @@ class RejectionSampler:
             num_nans=num_nans,
             num_sampled=num_sampled,
             num_rejected=num_rejected,
+        )
+
+    def forward_graph(
+        self,
+        logits: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        logits_indices: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+        temperature: torch.Tensor,
+        min_p: torch.Tensor,
+        top_p: torch.Tensor,
+        seeds: torch.Tensor,
+        draft_logits: torch.Tensor | None = None,
+    ) -> SamplerOutput:
+        num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
+
+        draft_sampled = input_ids[logits_indices]
+        draft_positions = positions[logits_indices]
+
+        processed_logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
+        thinking_budget = self.sampler.thinking_budget_state
+        if thinking_budget.enabled:
+            apply_thinking_budget(
+                processed_logits,
+                idx_mapping,
+                expanded_idx_mapping,
+                thinking_budget.thinking_token_budget.gpu,
+                thinking_budget.req_states.all_token_ids.gpu,
+                thinking_budget.req_states.total_len.gpu,
+                draft_sampled,
+                expanded_local_pos,
+                thinking_budget.cached_last_start,
+                thinking_budget.cached_last_end,
+                thinking_budget.cached_scan_pos,
+                thinking_budget.reasoning_start_token_ids,
+                thinking_budget.natural_reasoning_end_token_ids,
+                thinking_budget.reasoning_end_token_ids,
+            )
+        apply_temperature(processed_logits, expanded_idx_mapping, temperature)
+        apply_min_p(processed_logits, expanded_idx_mapping, min_p)
+        processed_logits = apply_top_k_top_p(
+            processed_logits,
+            None,
+            top_p[expanded_idx_mapping],
+        )
+
+        sampled, num_sampled = rejection_sample(
+            processed_logits,
+            draft_logits,
+            draft_sampled,
+            cu_num_logits,
+            draft_positions,
+            idx_mapping,
+            expanded_idx_mapping,
+            expanded_local_pos,
+            temperature,
+            seeds,
+            self.num_speculative_steps,
+            self.synthetic_conditional_rates,
+            use_fp64=self.sampler.use_fp64_gumbel,
+            use_block_verification=self.use_block_verification,
+        )
+
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            # Output logprobs are not supported during cudagraph capture.
+            logprobs_tensors=None,
+            num_nans=num_nans,
+            num_sampled=num_sampled,
         )
