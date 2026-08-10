@@ -184,6 +184,15 @@ class ModelOptQuantConfigBase(QuantizationConfig):
         # handle exclusion
         if self.is_layer_excluded(prefix):
             if isinstance(layer, (LinearBase, ParallelLMHead)):
+                if any(
+                    fnmatch(prefix, pattern)
+                    for pattern in envs.VLLM_MODELOPT_ONLINE_FP8_PATTERNS
+                ):
+                    from vllm.model_executor.layers.quantization.online.fp8 import (
+                        Fp8PerTensorOnlineLinearMethod,
+                    )
+
+                    return Fp8PerTensorOnlineLinearMethod()
                 return UnquantizedLinearMethod()
             return None
 
