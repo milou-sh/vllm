@@ -487,6 +487,17 @@ std::tuple<int64_t, torch::stable::Tensor> allocate_shared_buffer_and_handle(
 int64_t open_mem_handle(torch::stable::Tensor& mem_handle);
 void free_shared_buffer(int64_t buffer);
 
+#ifdef USE_CUDA
+int64_t init_push_ar(int64_t rank, int64_t world_size,
+                     int64_t push_buffer_bytes, int64_t max_num_cta);
+torch::stable::Tensor get_push_ar_ipc_handle(int64_t manager);
+void post_init_push_ar(int64_t manager,
+                       const torch::stable::Tensor& all_handles);
+void push_ar_all_reduce(int64_t manager, torch::stable::Tensor& input,
+                        torch::stable::Tensor& output);
+void dispose_push_ar(int64_t manager);
+#endif
+
 // Activation kernels (shared CUDA/ROCm)
 void silu_and_mul(torch::stable::Tensor& out, torch::stable::Tensor& input);
 void silu_and_mul_clamp(torch::stable::Tensor& out,
