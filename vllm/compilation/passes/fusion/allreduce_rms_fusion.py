@@ -104,7 +104,7 @@ if hasattr(torch.ops._C, "scaled_fp4_quant"):
 FI_ALLREDUCE_FUSION_MAX_SIZE_MB: dict[int, dict[int, float]] = {
     90: {
         2: 64,  # 64MB
-        4: 2,  # 2MB
+        4: 14,  # 14MB
         8: 0.5,  # 0.5MB
     },
     100: {
