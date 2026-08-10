@@ -912,6 +912,21 @@ direct_register_custom_op(
 )
 
 
+def _supports_min_latency_fused_qkv_a(weight: torch.Tensor) -> bool:
+    if weight.dtype != torch.bfloat16 or not current_platform.is_cuda():
+        return False
+    shape = tuple(weight.shape)
+    if shape == (2112, 7168):
+        return current_platform.is_device_capability(
+            90
+        ) or current_platform.is_device_capability_family(100)
+    return (
+        envs.VLLM_GLM52_SM90_FUSED_A_GEMM
+        and shape == (2624, 6144)
+        and current_platform.is_device_capability(90)
+    )
+
+
 class DeepSeekV2FusedQkvAProjLinear(MergedColumnParallelLinear):
     def __init__(
         self,
@@ -929,19 +944,9 @@ class DeepSeekV2FusedQkvAProjLinear(MergedColumnParallelLinear):
             prefix=prefix,
         )
 
-        # Check if the DeepSeek V3 fused A GEMM kernel can be used.
-        # This kernel supports PDL and is optimized for low batch size.
-        self._use_min_latency_gemm = (
-            hasattr(self, "weight")
-            and self.weight.dtype == torch.bfloat16
-            and self.weight.shape[0] == 2112
-            and self.weight.shape[1] == 7168
-            and current_platform.is_cuda()
-            and (
-                current_platform.is_device_capability(90)
-                or current_platform.is_device_capability_family(100)
-            )
-        )
+        self._use_min_latency_gemm = hasattr(
+            self, "weight"
+        ) and _supports_min_latency_fused_qkv_a(self.weight)
 
     def forward(
         self,
