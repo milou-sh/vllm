@@ -177,6 +177,7 @@ if TYPE_CHECKING:
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
+    VLLM_MODELOPT_ONLINE_FP8_PATTERNS: list[str] = []
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
@@ -1464,6 +1465,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
         "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]
     ),
+    "VLLM_MODELOPT_ONLINE_FP8_PATTERNS": lambda: [
+        pattern.strip()
+        for pattern in os.environ.get("VLLM_MODELOPT_ONLINE_FP8_PATTERNS", "").split(
+            ","
+        )
+        if pattern.strip()
+    ],
     # The online quantization dtype for humming kernel
     "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
         os.environ.get("VLLM_HUMMING_ONLINE_QUANT_CONFIG", None)
