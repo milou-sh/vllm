@@ -488,8 +488,13 @@ def _last_cutoff_token(
     block_before = torch.where(block_idx == 0, 0, block_before)
     ordinal_in_block = local_ordinal - block_before
 
-    local_token = torch.full(
-        (num_rows,), org_vocab_size, dtype=torch.int64, device=local_logits.device
+    local_token = torch.where(
+        owner > rank,
+        org_vocab_size,
+        -1,
+    ).to(
+        dtype=torch.int64,
+        device=local_logits.device,
     )
     _select_cutoff_token_kernel[(num_rows,)](
         local_logits,
@@ -504,10 +509,7 @@ def _last_cutoff_token(
         org_vocab_size,
         BLOCK_SIZE=block_size,
     )
-    if tp_group is None or tp_group.world_size == 1:
-        return local_token
-    gathered = tp_group.all_gather(local_token, dim=0)
-    return gathered.view(tp_group.world_size, num_rows).amin(dim=0)
+    return local_token
 
 
 def distributed_bf16_top_p_cutoff(
