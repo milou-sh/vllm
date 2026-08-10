@@ -752,7 +752,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
                    "in CUDA target architectures.")
   endif()
 
-  # FP32 router GEMM (H=3072, E=256, M<=32). Requires SM90+ and CUDA >= 12.0.
+  # FP32 router GEMM for selected MoE shapes with M<=32. Requires SM90+ and CUDA >= 12.0.
   cuda_archs_sm90plus(FP32_ROUTER_GEMM_ARCHS "${CUDA_ARCHS}")
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.0 AND FP32_ROUTER_GEMM_ARCHS)
     set(FP32_ROUTER_GEMM_SRCS
