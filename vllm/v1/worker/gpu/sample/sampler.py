@@ -292,10 +292,7 @@ class Sampler:
         """Return whether this request batch will use FlashInfer sampling."""
         return self.use_flashinfer and not (
             (top_k is None and top_p is None)
-            or (
-                return_logprobs
-                and self.logprobs_mode in PROCESSED_LOGPROBS_MODES
-            )
+            or (return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES)
             or self.sampling_states.any_greedy(idx_mapping_np)
             or self.sampling_states.any_explicit_seed(idx_mapping_np)
             or self.use_fp64_gumbel
