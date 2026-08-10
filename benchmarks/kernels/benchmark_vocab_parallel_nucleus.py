@@ -81,6 +81,8 @@ def _make_logits(args, num_rows: int, device: torch.device) -> torch.Tensor:
     if args.distribution == "peaked":
         logits[:, 0] += 13.0
         logits[:, 1:8] += 8.0
+    elif args.distribution == "masked":
+        logits[:, args.valid_vocab :] = -float("inf")
     return logits
 
 
@@ -94,12 +96,18 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument(
-        "--distribution", choices=("normal", "peaked", "captured"), default="normal"
+        "--distribution",
+        choices=("normal", "peaked", "masked", "captured"),
+        default="normal",
     )
+    parser.add_argument("--valid-vocab", type=int, default=2048)
+    parser.add_argument("--seed", type=int, default=20260810)
     parser.add_argument("--logits-file")
     parser.add_argument("--measure-lm-head", action="store_true")
     parser.add_argument("--require-output-equality", action="store_true")
     args = parser.parse_args()
+    if args.distribution == "masked" and not 0 < args.valid_vocab <= args.vocab_size:
+        raise ValueError("valid-vocab must be in [1, vocab-size]")
 
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -117,7 +125,7 @@ def main():
     num_rows = args.num_requests * logits_per_req
     local_vocab = args.vocab_size // world_size
     vocab_start = rank * local_vocab
-    torch.manual_seed(20260810)
+    torch.manual_seed(args.seed)
     global_logits = _make_logits(args, num_rows, device)
     local_logits = global_logits[
         :, vocab_start : vocab_start + local_vocab
@@ -301,6 +309,10 @@ def main():
                     "vocab_size": args.vocab_size,
                     "top_p": args.top_p,
                     "distribution": args.distribution,
+                    "seed": args.seed,
+                    "valid_vocab": (
+                        args.valid_vocab if args.distribution == "masked" else None
+                    ),
                     "logits_file": args.logits_file,
                     "allreduce_flashinfer": os.getenv(
                         "VLLM_ALLREDUCE_USE_FLASHINFER", "0"
