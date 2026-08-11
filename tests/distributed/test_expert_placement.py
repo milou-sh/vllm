@@ -5,7 +5,39 @@ import pytest
 
 from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     determine_expert_map,
+    determine_profiled_expert_map,
 )
+
+
+def test_profiled_expert_map():
+    assignment = (3, 0, 1, 2, 0, 2, 3, 1)
+    expected = {
+        0: [-1, 0, -1, -1, 1, -1, -1, -1],
+        1: [-1, -1, 0, -1, -1, -1, -1, 1],
+        2: [-1, -1, -1, 0, -1, 1, -1, -1],
+        3: [0, -1, -1, -1, -1, -1, 1, -1],
+    }
+    for rank in range(4):
+        local_count, expert_map = determine_profiled_expert_map(
+            assignment, ep_size=4, ep_rank=rank, global_num_experts=8
+        )
+        assert local_count == 2
+        assert expert_map.tolist() == expected[rank]
+
+
+@pytest.mark.parametrize(
+    "assignment,error",
+    [
+        ((0, 1), "expected 4"),
+        ((0, 0, 1, 4), "outside"),
+        ((0, 0, 0, 1), "equal slots"),
+    ],
+)
+def test_profiled_expert_map_rejects_invalid_assignment(assignment, error):
+    with pytest.raises(ValueError, match=error):
+        determine_profiled_expert_map(
+            assignment, ep_size=2, ep_rank=0, global_num_experts=4
+        )
 
 
 def verify_round_robin_pattern(expert_map, ep_rank, ep_size, global_num_experts):

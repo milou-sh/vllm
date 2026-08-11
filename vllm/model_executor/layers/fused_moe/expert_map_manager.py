@@ -7,6 +7,12 @@ This module contains the ExpertMapManager class which manages expert ID
 mappings and placement strategies for Expert Parallelism in MoE models.
 """
 
+import json
+import os
+import re
+from functools import lru_cache
+from pathlib import Path
+
 import torch
 
 from vllm.config.parallel import ExpertPlacementStrategy
@@ -17,6 +23,54 @@ from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
 )
 
 logger = init_logger(__name__)
+
+
+@lru_cache(maxsize=4)
+def load_expert_placement_file(path: str) -> dict[int, tuple[int, ...]]:
+    """Load and validate a privacy-safe offline expert placement plan."""
+    document = json.loads(Path(path).read_text())
+    if document.get("schema_version") != "vllm-expert-placement-v1":
+        raise ValueError(f"Unsupported expert placement schema in {path}")
+    layers = document.get("layers")
+    if not isinstance(layers, dict):
+        raise ValueError(f"Expert placement file {path} has no layer mapping")
+    result: dict[int, tuple[int, ...]] = {}
+    for layer, assignment in layers.items():
+        if not isinstance(assignment, list) or not all(
+            isinstance(rank, int) for rank in assignment
+        ):
+            raise ValueError(f"Invalid expert assignment for layer {layer} in {path}")
+        result[int(layer)] = tuple(assignment)
+    return result
+
+
+def determine_profiled_expert_map(
+    assignment: tuple[int, ...],
+    ep_size: int,
+    ep_rank: int,
+    global_num_experts: int,
+) -> tuple[int, torch.Tensor]:
+    """Build a rank-local map from a layer-wise logical-expert assignment."""
+    if len(assignment) != global_num_experts:
+        raise ValueError(
+            f"Expert placement has {len(assignment)} experts, expected "
+            f"{global_num_experts}"
+        )
+    if any(rank < 0 or rank >= ep_size for rank in assignment):
+        raise ValueError(f"Expert placement contains a rank outside [0, {ep_size})")
+    counts = [assignment.count(rank) for rank in range(ep_size)]
+    if len(set(counts)) != 1:
+        raise ValueError(
+            f"Expert placement must allocate equal slots per rank, got {counts}"
+        )
+    local_experts = [
+        expert
+        for expert, assigned_rank in enumerate(assignment)
+        if assigned_rank == ep_rank
+    ]
+    expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32)
+    expert_map[local_experts] = torch.arange(len(local_experts), dtype=torch.int32)
+    return len(local_experts), expert_map
 
 
 def determine_expert_map(
@@ -192,6 +246,7 @@ class ExpertMapManager:
         enable_eplb: bool,
         num_fused_shared_experts: int = 0,
         rocm_aiter_enabled: bool = False,
+        layer_name: str = "",
     ):
         """
         Initialize expert map manager.
@@ -210,6 +265,7 @@ class ExpertMapManager:
         self.rocm_aiter_enabled = rocm_aiter_enabled
         self.top_k = top_k
         self.max_num_batched_tokens = max_num_batched_tokens
+        self.layer_name = layer_name
 
         if moe_parallel_config.use_ep:
             # Determine expert placement strategy before creating manager
@@ -439,6 +495,35 @@ class ExpertMapManager:
 
     def _calculate_expert_maps(self) -> None:
         """Calculate expert mappings based on placement strategy."""
+        placement_path = os.getenv("VLLM_EXPERT_PLACEMENT_FILE")
+        layer_match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", self.layer_name)
+        if placement_path and self.use_ep and layer_match:
+            layer = int(layer_match.group(1))
+            placements = load_expert_placement_file(placement_path)
+            assignment = placements.get(layer)
+            if assignment is not None:
+                if self.num_fused_shared_experts or self.rocm_aiter_enabled:
+                    raise ValueError(
+                        "Offline expert placement does not support fused shared "
+                        "experts or AITER"
+                    )
+                self._local_num_experts, self._expert_map = (
+                    determine_profiled_expert_map(
+                        assignment=assignment,
+                        ep_size=self.ep_size,
+                        ep_rank=self.ep_rank,
+                        global_num_experts=self.global_num_experts,
+                    )
+                )
+                self._expert_mask = None
+                logger.info_once(
+                    "[EP Rank %s/%s] Loaded offline placement for layer %s from %s",
+                    self.ep_rank,
+                    self.ep_size,
+                    layer,
+                    placement_path,
+                )
+                return
         (
             self._local_num_experts,
             self._expert_map,
