@@ -12,6 +12,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
     _AR_RESIDUAL_RMS_NORM,
     _can_use_flashinfer,
@@ -36,6 +37,26 @@ def fused_allreduce_rms_norm(
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size == 1:
         return norm(hidden_states, residual)
+
+    tp_group = get_tp_group()
+    device_communicator = tp_group.device_communicator
+    push_ar = (
+        getattr(device_communicator, "push_ar_comm", None)
+        if device_communicator is not None
+        else None
+    )
+    if push_ar is not None and push_ar.should_use_fused_residual_rms_norm(
+        hidden_states, residual, norm.weight
+    ):
+        norm_out = torch.empty_like(hidden_states)
+        push_ar.fused_residual_rms_norm(
+            hidden_states,
+            residual,
+            norm.weight,
+            norm.variance_epsilon,
+            norm_out,
+        )
+        return norm_out, hidden_states
 
     if flashinfer_trtllm_fused_allreduce_norm is not None:
         ok, max_token_num = _can_use_flashinfer(hidden_states, tp_size)

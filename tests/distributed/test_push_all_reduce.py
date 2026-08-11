@@ -66,11 +66,13 @@ def test_push_ar_ops_registered():
     assert hasattr(ops, "get_push_ar_ipc_handle")
     assert hasattr(ops, "post_init_push_ar")
     assert hasattr(ops, "push_ar_all_reduce")
+    assert hasattr(ops, "push_ar_residual_rms_norm")
     assert hasattr(ops, "dispose_push_ar")
     assert hasattr(torch.ops._C_push_ar, "init_push_ar")
     assert hasattr(torch.ops._C_push_ar, "get_push_ar_ipc_handle")
     assert hasattr(torch.ops._C_push_ar, "post_init_push_ar")
     assert hasattr(torch.ops._C_push_ar, "push_ar_all_reduce")
+    assert hasattr(torch.ops._C_push_ar, "push_ar_residual_rms_norm")
     assert hasattr(torch.ops._C_push_ar, "dispose_push_ar")
 
 
@@ -170,6 +172,163 @@ def test_push_ar_should_use():
         _push_ar_should_use_worker,
         args=(2, _find_free_port()),
         nprocs=2,
+        join=True,
+    )
+
+
+def test_push_ar_fused_residual_rms_norm_guards():
+    """The H200/GLM specialization must fall back for every other shape."""
+    from vllm.distributed.device_communicators.push_all_reduce import (
+        PushAllReduce,
+    )
+
+    push_ar = PushAllReduce.__new__(PushAllReduce)
+    push_ar.disabled = False
+    push_ar.world_size = 4
+    push_ar.compute_capability = (9, 0)
+    push_ar.num_sm = 132
+    push_ar.max_message_bytes = 512 * 1024
+
+    input_ = torch.ones(2, 6144, dtype=torch.bfloat16)
+    residual = torch.ones_like(input_)
+    weight = torch.ones(6144, dtype=torch.bfloat16)
+
+    def eligible(
+        candidate_input=input_,
+        candidate_residual=residual,
+        candidate_weight=weight,
+    ) -> bool:
+        return push_ar.should_use_fused_residual_rms_norm(
+            candidate_input, candidate_residual, candidate_weight
+        )
+
+    assert eligible()
+
+    push_ar.disabled = True
+    assert not eligible()
+    push_ar.disabled = False
+
+    push_ar.world_size = 2
+    assert not eligible()
+    push_ar.world_size = 4
+
+    push_ar.compute_capability = (10, 0)
+    assert not eligible()
+    push_ar.compute_capability = (9, 0)
+
+    fp16_input = input_.to(torch.float16)
+    assert not eligible(
+        fp16_input, residual.to(torch.float16), weight.to(torch.float16)
+    )
+    assert not eligible(input_, residual.to(torch.float32), weight)
+    assert not eligible(input_, residual, weight.to(torch.float32))
+    assert not eligible(input_[:, :4096], residual[:, :4096], weight[:4096])
+    assert not eligible(input_, residual[:1], weight)
+    assert not eligible(input_, residual, weight[:4096])
+    assert not eligible(input_, residual, weight.reshape(1, -1))
+
+    noncontiguous_residual = torch.ones(6144, 2, dtype=torch.bfloat16).T
+    noncontiguous_weight = torch.ones(12288, dtype=torch.bfloat16)[::2]
+    assert not noncontiguous_residual.is_contiguous()
+    assert not noncontiguous_weight.is_contiguous()
+    assert not eligible(input_, noncontiguous_residual, weight)
+    assert not eligible(input_, residual, noncontiguous_weight)
+
+    meta_residual = torch.empty_like(residual, device="meta")
+    meta_weight = torch.empty_like(weight, device="meta")
+    assert not eligible(input_, meta_residual, weight)
+    assert not eligible(input_, residual, meta_weight)
+
+    over_buffer = torch.ones(43, 6144, dtype=torch.bfloat16)
+    assert not eligible(over_buffer, torch.ones_like(over_buffer), weight)
+    over_cta_limit = torch.ones(133, 6144, dtype=torch.bfloat16)
+    push_ar.max_message_bytes = over_cta_limit.numel() * over_cta_limit.element_size()
+    assert not eligible(over_cta_limit, torch.ones_like(over_cta_limit), weight)
+
+
+def _push_ar_fused_rms_norm_worker(rank, world_size, port):
+    cpu_group, _ = _init_groups(rank, world_size, port)
+    device = torch.device(f"cuda:{rank}")
+
+    from vllm.distributed.device_communicators.push_all_reduce import (
+        PushAllReduce,
+    )
+
+    push_ar = PushAllReduce(group=cpu_group, device=device, max_size=512 * 1024)
+    epsilon = 1e-6
+    weight = torch.linspace(
+        0.5, 1.5, 6144, dtype=torch.bfloat16, device=device
+    )
+
+    def reference(rows):
+        reduced = torch.full(
+            (rows, 6144),
+            world_size * (world_size + 1) / 2,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        residual = torch.randn(
+            rows, 6144, dtype=torch.bfloat16, device=device
+        )
+        updated = (reduced.float() + residual.float()).bfloat16()
+        inverse_rms = torch.rsqrt(
+            updated.float().square().mean(dim=-1, keepdim=True) + epsilon
+        )
+        normalized = (updated.float() * inverse_rms * weight.float()).bfloat16()
+        return residual, updated, normalized
+
+    for rows in (1, 10, 20, 32, 40):
+        residual, expected_residual, expected_norm = reference(rows)
+        input_ = torch.full(
+            (rows, 6144), rank + 1, dtype=torch.bfloat16, device=device
+        )
+        norm_out = torch.empty_like(input_)
+        assert push_ar.should_use_fused_residual_rms_norm(input_, residual, weight)
+        push_ar.fused_residual_rms_norm(
+            input_, residual, weight, epsilon, norm_out
+        )
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(input_, expected_residual, rtol=0, atol=0)
+        torch.testing.assert_close(norm_out, expected_norm, rtol=0, atol=0.0078125)
+
+    rows = 10
+    residual, expected_residual, expected_norm = reference(rows)
+    graph_input = torch.full(
+        (rows, 6144), rank + 1, dtype=torch.bfloat16, device=device
+    )
+    graph_norm_out = torch.empty_like(graph_input)
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize(device)
+    with torch.cuda.graph(graph):
+        push_ar.fused_residual_rms_norm(
+            graph_input, residual, weight, epsilon, graph_norm_out
+        )
+    for _ in range(25):
+        graph_input.fill_(rank + 1)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(graph_input, expected_residual, rtol=0, atol=0)
+        torch.testing.assert_close(
+            graph_norm_out, expected_norm, rtol=0, atol=0.0078125
+        )
+
+    push_ar.close()
+    _teardown()
+
+
+def test_push_ar_fused_residual_rms_norm():
+    world_size = 4
+    if torch.accelerator.device_count() < world_size:
+        pytest.skip("Need four GPUs")
+    if any(
+        torch.cuda.get_device_capability(index) != (9, 0)
+        for index in range(world_size)
+    ):
+        pytest.skip("The specialized kernel requires four SM90 GPUs")
+    mp.spawn(
+        _push_ar_fused_rms_norm_worker,
+        args=(world_size, _find_free_port()),
+        nprocs=world_size,
         join=True,
     )
 

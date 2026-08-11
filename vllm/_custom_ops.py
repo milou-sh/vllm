@@ -3243,6 +3243,20 @@ def push_ar_all_reduce(mgr: int, inp: torch.Tensor, out: torch.Tensor) -> None:
     torch.ops._C_push_ar.push_ar_all_reduce(mgr, inp, out)
 
 
+def push_ar_residual_rms_norm(
+    mgr: int,
+    inp: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    norm_out: torch.Tensor,
+    block_threads: int,
+) -> None:
+    torch.ops._C_push_ar.push_ar_residual_rms_norm(
+        mgr, inp, residual, weight, epsilon, norm_out, block_threads
+    )
+
+
 def dispose_push_ar(mgr: int) -> None:
     torch.ops._C_push_ar.dispose_push_ar(mgr)
 
