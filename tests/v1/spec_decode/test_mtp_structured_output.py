@@ -189,7 +189,9 @@ def test_bitmask_constrained_when_reasoning_ends_midwindow(backend):
 
 
 @pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
-def test_bitmask_post_reasoning_end_drafts_skip_grammar_advance(backend):
+def test_bitmask_post_reasoning_end_drafts_skip_grammar_advance(
+    backend, monkeypatch
+):
     """Post-marker drafts predate the bitmask and may be grammar-invalid;
     grammar_bitmask must skip the grammar advance instead of asserting.
     """
@@ -200,6 +202,13 @@ def test_bitmask_post_reasoning_end_drafts_skip_grammar_advance(backend):
 
     assert grammar.accept_tokens(request.request_id, prompt)
     assert not grammar.is_terminated()
+    accepted_tokens = []
+
+    def record_accept_tokens(_request_id, tokens):
+        accepted_tokens.extend(tokens)
+        return False
+
+    monkeypatch.setattr(grammar, "accept_tokens", record_accept_tokens)
 
     marker = tokenizer.encode("\n")[0]
 
@@ -235,6 +244,7 @@ def test_bitmask_post_reasoning_end_drafts_skip_grammar_advance(backend):
     assert not (bitmask[2] == -1).all()
     # Grammar must not have advanced through the unvalidated draft.
     assert not grammar.is_terminated()
+    assert accepted_tokens == []
 
 
 @pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
