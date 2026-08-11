@@ -336,6 +336,7 @@ class SpeculativeConfig:
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         initial_architecture = hf_config.architectures[0]
+        initial_model_type = hf_config.model_type
         if hf_config.model_type in (
             "deepseek_v3",
             "deepseek_v32",
@@ -345,7 +346,14 @@ class SpeculativeConfig:
         if hf_config.model_type == "deepseek_mtp":
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
             hf_config.update(
-                {"n_predict": n_predict, "architectures": ["DeepSeekMTPModel"]}
+                {
+                    "n_predict": n_predict,
+                    "architectures": [
+                        "GlmMoeDsaMTPModel"
+                        if initial_model_type == "glm_moe_dsa"
+                        else "DeepSeekMTPModel"
+                    ],
+                }
             )
         if hf_config.model_type == "deepseek_v4":
             hf_config.model_type = "deepseek_mtp"
