@@ -138,11 +138,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
 
         if (
-            use_custom_allreduce
-            and self.world_size > 1
+            self.world_size > 1
             and current_platform.is_cuda()
-            and self.ca_comm is not None
-            and not self.ca_comm.disabled
+            and unique_name.split(":", 1)[0] == "tp"
+            and (
+                envs.VLLM_ENABLE_PUSH_ALLREDUCE
+                or (
+                    use_custom_allreduce
+                    and self.ca_comm is not None
+                    and not self.ca_comm.disabled
+                )
+            )
         ):
             try:
                 from vllm.distributed.device_communicators.push_all_reduce import (

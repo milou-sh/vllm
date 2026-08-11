@@ -103,6 +103,43 @@ void push_ar_all_reduce(fptr_t _mgr, torch::stable::Tensor& inp,
   }
 }
 
+void push_ar_residual_rms_norm(fptr_t _mgr, torch::stable::Tensor& input,
+                               const torch::stable::Tensor& residual,
+                               const torch::stable::Tensor& weight,
+                               double epsilon,
+                               torch::stable::Tensor& norm_out,
+                               int64_t block_threads) {
+  auto* mgr = reinterpret_cast<PushAllReduceManager*>(_mgr);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      input.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream(input.get_device_index());
+
+  STD_TORCH_CHECK(input.scalar_type() ==
+                  torch::headeronly::ScalarType::BFloat16);
+  STD_TORCH_CHECK(residual.scalar_type() == input.scalar_type());
+  STD_TORCH_CHECK(weight.scalar_type() == input.scalar_type());
+  STD_TORCH_CHECK(norm_out.scalar_type() == input.scalar_type());
+  STD_TORCH_CHECK(input.dim() == 2);
+  STD_TORCH_CHECK(residual.dim() == 2);
+  STD_TORCH_CHECK(norm_out.dim() == 2);
+  STD_TORCH_CHECK(weight.dim() == 1);
+  STD_TORCH_CHECK(input.numel() == residual.numel());
+  STD_TORCH_CHECK(input.numel() == norm_out.numel());
+  STD_TORCH_CHECK(input.size(1) == weight.size(0));
+  STD_TORCH_CHECK(is_weak_contiguous(input));
+  STD_TORCH_CHECK(residual.is_contiguous());
+  STD_TORCH_CHECK(weight.is_contiguous());
+  STD_TORCH_CHECK(norm_out.is_contiguous());
+
+  mgr->allreduce_residual_rms_norm(
+      stream, reinterpret_cast<nv_bfloat16*>(input.mutable_data_ptr()),
+      reinterpret_cast<const nv_bfloat16*>(residual.const_data_ptr()),
+      reinterpret_cast<const nv_bfloat16*>(weight.const_data_ptr()),
+      reinterpret_cast<nv_bfloat16*>(norm_out.mutable_data_ptr()),
+      input.numel(), input.size(1), static_cast<float>(epsilon),
+      static_cast<int>(block_threads));
+}
+
 void dispose_push_ar(fptr_t _mgr) {
   auto* mgr = reinterpret_cast<PushAllReduceManager*>(_mgr);
   delete mgr;

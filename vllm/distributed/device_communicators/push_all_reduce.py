@@ -20,6 +20,12 @@ from contextlib import contextmanager
 import torch
 import torch.distributed as dist
 
+# Candidate images can ship Push-AR as an isolated stable-ABI library instead
+# of replacing vLLM's monolithic extension. Upstream/full builds leave this
+# unset because the operator is registered by _C_stable_libtorch.
+if push_ar_library := os.environ.get("VLLM_PUSH_AR_LIBRARY"):
+    torch.ops.load_library(push_ar_library)
+
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.distributed.device_communicators.custom_all_reduce import (
@@ -104,6 +110,7 @@ class PushAllReduce:
         # Get SM count and architecture for grid size and threshold selection
         props = torch.cuda.get_device_properties(device)
         self.num_sm = props.multi_processor_count
+        self.compute_capability = (props.major, props.minor)
 
         # Determine push buffer size from architecture-specific threshold map
         if max_size is not None:
@@ -216,6 +223,62 @@ class PushAllReduce:
             out = torch.empty_like(input_)
             ops.push_ar_all_reduce(self._ptr, input_, out)
             return out
+
+    def should_use_fused_residual_rms_norm(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> bool:
+        """Gate the GLM/H200 fused collective to its measured production shape."""
+        return (
+            not self.disabled
+            and self.world_size == 4
+            and self.compute_capability == (9, 0)
+            and input_.dtype == torch.bfloat16
+            and input_.dim() == 2
+            and input_.shape[1] == 6144
+            and input_.shape == residual.shape
+            and residual.dtype == input_.dtype
+            and weight.dtype == input_.dtype
+            and weight.dim() == 1
+            and weight.numel() == input_.shape[1]
+            and input_.device == residual.device
+            and input_.device == weight.device
+            and residual.is_contiguous()
+            and weight.is_contiguous()
+            and input_.shape[0] <= self.num_sm
+            and self.should_use(input_)
+        )
+
+    def fused_residual_rms_norm(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+        norm_out: torch.Tensor,
+    ) -> None:
+        if not getattr(self, "_logged_fused_residual_rms_norm", False):
+            logger.info(
+                "PushAllReduce fused residual RMSNorm enabled: "
+                "sm=%d%d, tp=%d, hidden=%d, max_message=%d bytes, threads=%d",
+                *self.compute_capability,
+                self.world_size,
+                input_.shape[1],
+                self.max_message_bytes,
+                envs.VLLM_PUSH_AR_RMS_THREADS,
+            )
+            self._logged_fused_residual_rms_norm = True
+        ops.push_ar_residual_rms_norm(
+            self._ptr,
+            input_,
+            residual,
+            weight,
+            epsilon,
+            norm_out,
+            envs.VLLM_PUSH_AR_RMS_THREADS,
+        )
 
     @contextmanager
     def capture(self):

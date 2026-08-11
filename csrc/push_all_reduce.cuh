@@ -152,6 +152,66 @@ class PushAllReduceManager {
     launch_kernel<T>(config, params);
   }
 
+  void allreduce_residual_rms_norm(
+      cudaStream_t stream, nv_bfloat16* input, const nv_bfloat16* residual,
+      const nv_bfloat16* weight, nv_bfloat16* norm_out, int num_elements,
+      int hidden_size, float epsilon, int block_threads) {
+    assert(ctrl_initialized_);
+    assert(num_elements > 0);
+    if (hidden_size <= 0 || num_elements % hidden_size != 0 ||
+        hidden_size % 8 != 0) {
+      throw std::runtime_error(
+          "push_allreduce_rms_norm: invalid hidden size or shape");
+    }
+    const int num_rows = num_elements / hidden_size;
+    if (num_rows > max_num_cta_) {
+      throw std::runtime_error(
+          "push_allreduce_rms_norm: rows exceed allocated CTA signals");
+    }
+    if (block_threads != 128 && block_threads != 256 && block_threads != 512 &&
+        block_threads != 1024) {
+      throw std::runtime_error(
+          "push_allreduce_rms_norm: threads must be 128, 256, 512 or 1024");
+    }
+    const int64_t input_bytes =
+        static_cast<int64_t>(sizeof(nv_bfloat16)) * num_elements;
+    if (input_bytes > push_buffer_bytes_) {
+      throw std::runtime_error(
+          "push_allreduce_rms_norm: input exceeds push buffer capacity");
+    }
+
+    AllReducePushData params;
+    for (int i = 0; i < world_size_; ++i) {
+      params.buffer[i] = get_push_buffer(peer_storage_[i]);
+    }
+    for (int i = world_size_; i < static_cast<int>(kMaxNumGPU); ++i) {
+      params.buffer[i] = nullptr;
+    }
+    params.input = input;
+    params.output = input;
+    params.rank = rank_;
+    params.num_items = static_cast<uint32_t>(num_elements);
+    params.buffer_bytes = static_cast<uint32_t>(push_buffer_bytes_);
+    params.epoch_bytes = world_size_ * params.buffer_bytes;
+
+    cudaLaunchConfig_t config = {};
+    config.gridDim = dim3(num_rows);
+    config.blockDim = dim3(block_threads);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    config.numAttrs = 0;
+    config.attrs = attrs;
+    if (use_pdl_) {
+      attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attrs[0].val.programmaticStreamSerializationAllowed = 1;
+      config.numAttrs = 1;
+    }
+
+    launch_rms_norm_kernel(config, params, residual, weight, norm_out,
+                           hidden_size, epsilon);
+  }
+
  private:
   // Template dispatch helper
   template <typename T>
@@ -191,6 +251,46 @@ class PushAllReduceManager {
         cudaLaunchKernelEx(&config, kernel, params, push_ctrl_);
       }
     }
+  }
+
+  void launch_rms_norm_kernel(const cudaLaunchConfig_t& config,
+                              const AllReducePushData& params,
+                              const nv_bfloat16* residual,
+                              const nv_bfloat16* weight,
+                              nv_bfloat16* norm_out, int hidden_size,
+                              float epsilon) {
+#define LAUNCH_PUSH_RMS(NUM_GPU, USE_PDL)                                     \
+  cudaLaunchKernelEx(                                                         \
+      &config,                                                                \
+      all_reduce_residual_rms_norm_push_kernel<NUM_GPU, USE_PDL>, params,     \
+      push_ctrl_, residual, weight, norm_out,                                 \
+      static_cast<uint32_t>(hidden_size), epsilon)
+    if (world_size_ == 4) {
+      if (use_pdl_) {
+        LAUNCH_PUSH_RMS(4, true);
+      } else {
+        LAUNCH_PUSH_RMS(4, false);
+      }
+    } else if (world_size_ == 2) {
+      if (use_pdl_) {
+        LAUNCH_PUSH_RMS(2, true);
+      } else {
+        LAUNCH_PUSH_RMS(2, false);
+      }
+    } else if (world_size_ == 6) {
+      if (use_pdl_) {
+        LAUNCH_PUSH_RMS(6, true);
+      } else {
+        LAUNCH_PUSH_RMS(6, false);
+      }
+    } else if (world_size_ == 8) {
+      if (use_pdl_) {
+        LAUNCH_PUSH_RMS(8, true);
+      } else {
+        LAUNCH_PUSH_RMS(8, false);
+      }
+    }
+#undef LAUNCH_PUSH_RMS
   }
 
   // Thread count selection (from SGLang CustomAllReducePush::all_reduce)

@@ -1017,11 +1017,17 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_push_ar, push_ar) {
   push_ar.def("post_init_push_ar(int manager, Tensor all_handles) -> ()");
   push_ar.def(
       "push_ar_all_reduce(int manager, Tensor input, Tensor! output) -> ()");
+  push_ar.def(
+      "push_ar_residual_rms_norm(int manager, Tensor! input, Tensor residual, "
+      "Tensor weight, float epsilon, Tensor! norm_out, int block_threads) -> "
+      "()");
   push_ar.def("dispose_push_ar(int manager) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_push_ar, CUDA, push_ar) {
   push_ar.impl("push_ar_all_reduce", TORCH_BOX(&push_ar_all_reduce));
+  push_ar.impl("push_ar_residual_rms_norm",
+               TORCH_BOX(&push_ar_residual_rms_norm));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_push_ar, CompositeExplicitAutograd, push_ar) {
