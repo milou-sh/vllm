@@ -495,6 +495,13 @@ void post_init_push_ar(int64_t manager,
                        const torch::stable::Tensor& all_handles);
 void push_ar_all_reduce(int64_t manager, torch::stable::Tensor& input,
                         torch::stable::Tensor& output);
+void push_ar_residual_rms_norm(int64_t manager,
+                               torch::stable::Tensor& input,
+                               const torch::stable::Tensor& residual,
+                               const torch::stable::Tensor& weight,
+                               double epsilon,
+                               torch::stable::Tensor& norm_out,
+                               int64_t block_threads);
 void dispose_push_ar(int64_t manager);
 #endif
 

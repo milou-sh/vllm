@@ -248,7 +248,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER: bool = False
+    VLLM_ENABLE_PUSH_ALLREDUCE: bool = False
     VLLM_DISABLE_PUSH_ALLREDUCE: bool = False
+    VLLM_PUSH_AR_RMS_THREADS: int = 1024
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1808,11 +1810,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ALLREDUCE_USE_FLASHINFER": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER", "0"))
     ),
+    # Opt in to the experimental push-based NVLink allreduce independently of
+    # vLLM's legacy custom-allreduce switch.
+    "VLLM_ENABLE_PUSH_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_PUSH_ALLREDUCE", "0"))
+    ),
     # If set to 1, disable push-based allreduce for small tensors.
     # When disabled, small tensor reductions fall back to the barrier-based
     # CustomAllreduce path.
     "VLLM_DISABLE_PUSH_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_DISABLE_PUSH_ALLREDUCE", "0"))
+    ),
+    # Block size for the fused Hopper Push-AR + residual + RMSNorm kernel.
+    "VLLM_PUSH_AR_RMS_THREADS": lambda: int(
+        os.getenv("VLLM_PUSH_AR_RMS_THREADS", "1024")
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(

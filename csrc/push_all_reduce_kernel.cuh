@@ -534,5 +534,155 @@ __global__ __launch_bounds__(1024, 1) void all_reduce_one_shot_push_kernel(
   ctrl.exit();
 }
 
+// GLM/Hopper specialization: fuse the residual add and RMSNorm into the
+// push-allreduce poll phase. One CTA owns one complete token row, which makes
+// the RMS reduction local to a block and avoids a second kernel launch. The
+// partial all-reduce result is first rounded to BF16, then the residual add is
+// rounded to BF16 before variance accumulation, matching vLLM's existing
+// fused_add_rms_norm semantics.
+template <uint32_t kNumGPU, bool kUsePDL>
+__global__ __launch_bounds__(1024, 1)
+    void all_reduce_residual_rms_norm_push_kernel(
+        const AllReducePushData __grid_constant__ params,
+        const PushController __grid_constant__ ctrl,
+        const bf16_t* __restrict__ residual,
+        const bf16_t* __restrict__ weight, bf16_t* __restrict__ norm_out,
+        const uint32_t hidden_size, const float epsilon) {
+  constexpr uint32_t kVecSize = 16 / (sizeof(bf16_t) * 2);
+  using Storage = AlignedVector<packed_t<bf16_t>, kVecSize>;
+
+  const auto [buffer, input, residual_out, rank, num_items, buffer_bytes,
+              epoch_bytes] = params;
+  const uint32_t row = blockIdx.x;
+  const uint32_t vectors_per_row = hidden_size / (kVecSize * 2);
+  const uint32_t row_vector_base = row * vectors_per_row;
+
+  PDLWaitPrimary<kUsePDL>();
+
+  const auto epoch_offset = ctrl.epoch() * epoch_bytes;
+  bf16_t* push_buf[kNumGPU];
+#pragma unroll
+  for (uint32_t gpu = 0; gpu < kNumGPU; ++gpu) {
+    push_buf[gpu] = static_cast<bf16_t*>(
+        ptr_byte_offset(buffer[gpu], rank * buffer_bytes, epoch_offset));
+  }
+
+  for (uint32_t vec = threadIdx.x; vec < vectors_per_row;
+       vec += blockDim.x) {
+    const uint32_t offset = row_vector_base + vec;
+    Storage value;
+    value.load(input, offset);
+#pragma unroll
+    for (uint32_t item = 0; item < kVecSize; ++item) {
+      clear_pos_zero(value[item].x);
+      clear_pos_zero(value[item].y);
+    }
+#pragma unroll
+    for (uint32_t gpu = 0; gpu < kNumGPU; ++gpu) {
+      st_global_volatile_16B(value, push_buf[gpu], offset);
+    }
+  }
+  __syncthreads();
+  PDLTriggerSecondary<kUsePDL>();
+
+  bf16_t* poll_buf[kNumGPU];
+#pragma unroll
+  for (uint32_t gpu = 0; gpu < kNumGPU; ++gpu) {
+    poll_buf[gpu] = static_cast<bf16_t*>(
+        ptr_byte_offset(buffer[rank], gpu * buffer_bytes, epoch_offset));
+  }
+
+  float variance = 0.0f;
+  for (uint32_t vec = threadIdx.x; vec < vectors_per_row;
+       vec += blockDim.x) {
+    const uint32_t offset = row_vector_base + vec;
+    Storage rank_values[kNumGPU];
+    while (true) {
+      bool waiting = false;
+#pragma unroll
+      for (uint32_t gpu = 0; gpu < kNumGPU; ++gpu) {
+        ld_global_volatile_16B(rank_values[gpu], poll_buf[gpu], offset);
+#pragma unroll
+        for (uint32_t item = 0; item < kVecSize; ++item) {
+          waiting |= is_pos_zero(rank_values[gpu][item].x);
+          waiting |= is_pos_zero(rank_values[gpu][item].y);
+        }
+      }
+      if (!waiting) break;
+    }
+
+    const Storage reduced = reduce_impl(rank_values);
+    Storage residual_value;
+    residual_value.load(residual, offset);
+    Storage updated;
+#pragma unroll
+    for (uint32_t item = 0; item < kVecSize; ++item) {
+      const fp32x2_t reduced_f32 = cast<fp32x2_t>(reduced[item]);
+      const fp32x2_t residual_f32 = cast<fp32x2_t>(residual_value[item]);
+      const fp32x2_t sum = {reduced_f32.x + residual_f32.x,
+                            reduced_f32.y + residual_f32.y};
+      updated[item] = cast<bf16x2_t>(sum);
+      const fp32x2_t rounded = cast<fp32x2_t>(updated[item]);
+      variance += rounded.x * rounded.x + rounded.y * rounded.y;
+    }
+    updated.store(residual_out, offset);
+
+    Storage positive_zeros;
+    positive_zeros.fill({get_pos_zero<bf16_t>(), get_pos_zero<bf16_t>()});
+#pragma unroll
+    for (uint32_t gpu = 0; gpu < kNumGPU; ++gpu) {
+      positive_zeros.store(poll_buf[gpu], offset);
+    }
+  }
+
+  // Block-wide FP32 sum. The maximum supported block size is 1024 threads.
+  const uint32_t lane = threadIdx.x & (kWarpThreads - 1);
+  const uint32_t warp = threadIdx.x / kWarpThreads;
+#pragma unroll
+  for (uint32_t delta = kWarpThreads / 2; delta > 0; delta /= 2) {
+    variance += __shfl_down_sync(0xffffffff, variance, delta);
+  }
+  __shared__ float warp_sums[32];
+  __shared__ float inverse_rms;
+  if (lane == 0) warp_sums[warp] = variance;
+  __syncthreads();
+  if (warp == 0) {
+    float block_sum = lane < (blockDim.x + kWarpThreads - 1) / kWarpThreads
+                          ? warp_sums[lane]
+                          : 0.0f;
+#pragma unroll
+    for (uint32_t delta = kWarpThreads / 2; delta > 0; delta /= 2) {
+      block_sum += __shfl_down_sync(0xffffffff, block_sum, delta);
+    }
+    if (lane == 0) {
+      inverse_rms = rsqrtf(block_sum / static_cast<float>(hidden_size) +
+                           epsilon);
+    }
+  }
+  __syncthreads();
+
+  for (uint32_t vec = threadIdx.x; vec < vectors_per_row;
+       vec += blockDim.x) {
+    const uint32_t offset = row_vector_base + vec;
+    Storage updated;
+    Storage gamma;
+    updated.load(residual_out, offset);
+    gamma.load(weight, vec);
+    Storage normalized;
+#pragma unroll
+    for (uint32_t item = 0; item < kVecSize; ++item) {
+      const fp32x2_t value_f32 = cast<fp32x2_t>(updated[item]);
+      const fp32x2_t gamma_f32 = cast<fp32x2_t>(gamma[item]);
+      const fp32x2_t norm_f32 = {
+          value_f32.x * inverse_rms * gamma_f32.x,
+          value_f32.y * inverse_rms * gamma_f32.y,
+      };
+      normalized[item] = cast<bf16x2_t>(norm_f32);
+    }
+    normalized.store(norm_out, offset);
+  }
+  ctrl.exit();
+}
+
 }  // namespace push_ar
 }  // namespace vllm
