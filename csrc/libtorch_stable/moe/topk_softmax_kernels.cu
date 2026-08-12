@@ -751,7 +751,7 @@ void topkGatingKernelLauncher(
 
     if constexpr (SF == SCORING_SIGMOID) {
       if (num_experts == 168 && topk == 8) {
-        constexpr int TPB = 256;
+        constexpr int TPB = 192;
         moeSigmoidTopK168<TPB, IndType, InputType>
             <<<num_tokens, TPB, 0, stream>>>(
                 gating_output, topk_weights, topk_indices,
@@ -959,7 +959,9 @@ void topk_sigmoid(
     const int topk = topk_weights.size(-1);
 
     const bool is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
-    const bool needs_workspace = !is_pow_2 || num_experts > 256;
+    const bool has_fused_e168_path = num_experts == 168 && topk == 8;
+    const bool needs_workspace =
+        (!is_pow_2 || num_experts > 256) && !has_fused_e168_path;
     const int64_t workspace_size = needs_workspace ? num_tokens * num_experts : 0;
 
     torch::stable::accelerator::DeviceGuard guard(gating_output.get_device_index());
