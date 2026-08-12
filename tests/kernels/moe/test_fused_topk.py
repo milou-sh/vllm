@@ -140,6 +140,53 @@ def test_fused_topk_bias(
 @pytest.mark.skipif(
     not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
 )
+@pytest.mark.parametrize("num_tokens", [1, 8, 44])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.half, torch.float32])
+def test_fused_topk_bias_glm_e168(
+    num_tokens: int,
+    dtype: torch.dtype,
+):
+    """Exercise GLM-5.2's E=168, sigmoid, bias and top-8 fast path."""
+    torch.manual_seed(20260812)
+    hidden_states = torch.randn(
+        (num_tokens, 6144), dtype=dtype, device="cuda"
+    )
+    gating_output = torch.randn(
+        (num_tokens, 168), dtype=dtype, device="cuda"
+    )
+    e_score_correction_bias = torch.randn(
+        168, dtype=torch.float32, device="cuda"
+    )
+    routed_scaling_factor = 2.5
+
+    topk_weights_ref, topk_ids_ref = torch_topk(
+        gating_output=gating_output,
+        topk=8,
+        renormalize=True,
+        e_score_correction_bias=e_score_correction_bias,
+        scoring_func="sigmoid",
+    )
+    topk_weights_ref *= routed_scaling_factor
+
+    topk_weights, topk_ids = fused_topk_bias(
+        hidden_states=hidden_states,
+        gating_output=gating_output,
+        e_score_correction_bias=e_score_correction_bias,
+        topk=8,
+        renormalize=True,
+        scoring_func="sigmoid",
+        routed_scaling_factor=routed_scaling_factor,
+    )
+
+    torch.testing.assert_close(
+        topk_weights_ref.float(), topk_weights, atol=2e-6, rtol=1e-5
+    )
+    torch.testing.assert_close(topk_ids_ref.int(), topk_ids, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
+)
 @pytest.mark.parametrize("num_experts", [6, 8, 16])
 @pytest.mark.parametrize("topk", [3, 4])
 @pytest.mark.parametrize("scoring_func", ["softmax", "sigmoid"])
