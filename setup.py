@@ -1188,6 +1188,15 @@ if _build_custom_ops():
         ext_modules.append(CMakeExtension(name="vllm._C_stable_libtorch"))
         ext_modules.append(CMakeExtension(name="vllm._moe_C_stable_libtorch"))
 
+# Kernel-development escape hatch: build only the stable-ABI MoE extension.
+# This avoids spending most of an edit/benchmark cycle compiling unrelated
+# attention and GEMM extensions. It is intentionally setup-only and opt-in;
+# normal wheels and production images keep the complete extension set.
+if os.getenv("VLLM_BUILD_MOE_ONLY", "").lower() in ("1", "true", "yes"):
+    if not _build_custom_ops():
+        raise RuntimeError("VLLM_BUILD_MOE_ONLY requires a CUDA or ROCm build")
+    ext_modules = [CMakeExtension(name="vllm._moe_C_stable_libtorch")]
+
 package_data = {
     "vllm": [
         "py.typed",
