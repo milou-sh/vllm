@@ -259,6 +259,72 @@ __launch_bounds__(TPB) __global__ void moeTopK(
     }
 }
 
+#ifndef USE_ROCM
+// GLM-5.2 uses 168 routed experts. The generic non-power-of-two path launches
+// one kernel to materialize all sigmoid scores in an FP32 workspace and a
+// second kernel to select top-k. Keep the scores and selection state in
+// registers instead: one block owns one token and produces the exact same
+// unbiased weights, bias-based choices, tie breaking, and source-row layout.
+//
+// This is intentionally narrow. Other expert counts and scoring functions keep
+// the existing, broadly tested dispatch until they have their own measurements.
+template <int TPB, typename IndType, typename InputType>
+__launch_bounds__(TPB) __global__ void moeSigmoidTopK168(
+    const InputType* input, float* output, IndType* indices, int* source_rows,
+    const int num_rows, const int k, const bool renormalize, const float* bias,
+    const double routed_scaling_factor, const bool* is_padding) {
+  static_assert(TPB >= 168);
+  using cub_kvp = cub::KeyValuePair<int, float>;
+  using BlockReduce = cub::BlockReduce<cub_kvp, TPB>;
+  __shared__ typename BlockReduce::TempStorage tmp_storage;
+  __shared__ float winner_score;
+
+  constexpr int num_experts = 168;
+  const int row = blockIdx.x;
+  const int expert = threadIdx.x;
+  const bool valid_expert = expert < num_experts;
+  float score = 0.f;
+  float choice = -FLT_MAX;
+  if (valid_expert) {
+    const float logit = toFloat(input[row * num_experts + expert]);
+    score = 1.0f / (1.0f + __expf(-logit));
+    if (isnan(score) || isinf(score)) score = 0.f;
+    choice = score + (bias == nullptr ? 0.f : bias[expert]);
+  }
+
+  const bool is_pad_row = is_padding != nullptr && is_padding[row];
+  float selected_sum = 0.f;
+  for (int k_idx = 0; k_idx < k; ++k_idx) {
+    cub_kvp candidate;
+    candidate.key = expert;
+    candidate.value = choice;
+    const cub_kvp winner =
+        BlockReduce(tmp_storage).Reduce(candidate, cub::ArgMax());
+    if (valid_expert && expert == winner.key) winner_score = score;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      const int idx = k * row + k_idx;
+      output[idx] = winner_score;
+      indices[idx] =
+          is_pad_row ? static_cast<IndType>(-1) : static_cast<IndType>(winner.key);
+      source_rows[idx] = k_idx * num_rows + row;
+      if (renormalize) selected_sum += output[idx];
+    }
+    __syncthreads();
+    if (valid_expert && expert == winner.key) choice = -FLT_MAX;
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    float scale = static_cast<float>(routed_scaling_factor);
+    if (renormalize) scale /= selected_sum > 0.f ? selected_sum : 1.f;
+    for (int k_idx = 0; k_idx < k; ++k_idx) {
+      output[k * row + k_idx] *= scale;
+    }
+  }
+}
+#endif
+
 // ====================== TopK softmax things ===============================
 
 /*
@@ -675,6 +741,18 @@ void topkGatingKernelLauncher(
     // elements can be loaded by a warp
     static constexpr int BYTES_PER_LDG_MULTIPLE_64 =
     (std::is_same_v<InputType, __nv_bfloat16> || std::is_same_v<InputType, __half>) ? 4 : 8;
+
+    if constexpr (SF == SCORING_SIGMOID) {
+      if (num_experts == 168 && topk == 8) {
+        constexpr int TPB = 256;
+        moeSigmoidTopK168<TPB, IndType, InputType>
+            <<<num_tokens, TPB, 0, stream>>>(
+                gating_output, topk_weights, topk_indices,
+                token_expert_indices, num_tokens, topk, renormalize, bias,
+                routed_scaling_factor, is_padding);
+        return;
+      }
+    }
 #endif
     switch (num_experts) {
         case 1:
