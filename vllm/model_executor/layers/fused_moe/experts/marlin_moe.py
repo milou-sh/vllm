@@ -231,6 +231,43 @@ def _fused_marlin_moe(
     return output
 
 
+def _select_marlin_moe_block_size(
+    num_tokens: int,
+    topk: int,
+    local_num_experts: int,
+    global_num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    input_dtype: torch.dtype | None,
+) -> int:
+    """Select the routed-row tile for Marlin MoE.
+
+    The generic utilization heuristic remains the fallback.  The exact GLM-5.2
+    TP4 ModelOpt shape has a measured Hopper crossover before that heuristic:
+    with 168 experts/top-8 and its production routing distributions, M>=88 is
+    faster at tile 16, while M<=80 remains faster at tile 8.  The next generic
+    crossover already selects tile 16, so this changes only M=88..151.
+    """
+    estimated_tokens = math.ceil(num_tokens * local_num_experts / global_num_experts)
+    for block_size_m in [8, 16, 32, 48, 64]:
+        if estimated_tokens * topk / local_num_experts / block_size_m < 0.9:
+            break
+
+    if (
+        current_platform.is_device_capability(90)
+        and local_num_experts == global_num_experts == 168
+        and topk == 8
+        and hidden_size == 6144
+        and intermediate_size == 512
+        and 88 <= estimated_tokens < 152
+    ):
+        block_size_m = 16
+
+    if input_dtype is not None and input_dtype.itemsize == 1:
+        block_size_m = max(block_size_m, 16)
+    return block_size_m
+
+
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -324,18 +361,15 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
-    else:
-        # Set M to estimated valid tokens per rank
-        M = math.ceil(M * E / global_num_experts)
-
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
-
-    if input_dtype is not None and input_dtype.itemsize == 1:
-        block_size_m = max(block_size_m, 16)
+    block_size_m = _select_marlin_moe_block_size(
+        num_tokens=M,
+        topk=topk,
+        local_num_experts=E,
+        global_num_experts=global_num_experts,
+        hidden_size=K,
+        intermediate_size=marlin_moe_intermediate_size(w1, w2),
+        input_dtype=input_dtype,
+    )
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids,
