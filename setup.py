@@ -408,7 +408,9 @@ class cmake_build_ext(build_ext):
             os.makedirs(os.path.dirname(dst_file), exist_ok=True)
             self.copy_file(file, dst_file)
 
-        if _is_cuda() or _is_hip():
+        if (_is_cuda() or _is_hip()) and os.getenv(
+            "VLLM_BUILD_MOE_ONLY", ""
+        ).lower() not in ("1", "true", "yes"):
             # copy vllm/third_party/triton_kernels/**/*.py from self.build_lib
             # to current directory so that they can be included in the editable
             # build
