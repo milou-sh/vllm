@@ -355,6 +355,8 @@ ARG SCCACHE_ENDPOINT
 ARG VLLM_USE_PRECOMPILED=""
 ARG VLLM_MERGE_BASE_COMMIT=""
 ARG VLLM_MAIN_CUDA_VERSION=""
+ARG VLLM_BUILD_MOE_ONLY=""
+ENV VLLM_BUILD_MOE_ONLY=${VLLM_BUILD_MOE_ONLY}
 
 # Use dummy version for csrc-build wheel (only .so files are extracted, version doesn't matter)
 ENV SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0+csrc.build"
