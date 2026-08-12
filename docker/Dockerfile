@@ -409,6 +409,12 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38; \
     fi
 
+# Tiny export target for isolated stable-ABI kernel development. Using
+# --output=type=local with this stage avoids importing the complete 15+ GB
+# compiler filesystem into Docker merely to retrieve the wheel artifact.
+FROM scratch AS csrc-wheel-export
+COPY --from=csrc-build /workspace/dist/ /
+
 #################### CSRC BUILD IMAGE ####################
 
 #################### EXTENSIONS BUILD IMAGE ####################

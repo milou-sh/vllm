@@ -277,6 +277,7 @@ __launch_bounds__(TPB) __global__ void moeSigmoidTopK168(
   using cub_kvp = cub::KeyValuePair<int, float>;
   using BlockReduce = cub::BlockReduce<cub_kvp, TPB>;
   __shared__ typename BlockReduce::TempStorage tmp_storage;
+  __shared__ int winner_expert;
   __shared__ float winner_score;
 
   constexpr int num_experts = 168;
@@ -300,18 +301,24 @@ __launch_bounds__(TPB) __global__ void moeSigmoidTopK168(
     candidate.value = choice;
     const cub_kvp winner =
         BlockReduce(tmp_storage).Reduce(candidate, cub::ArgMax());
-    if (valid_expert && expert == winner.key) winner_score = score;
+    // CUB only guarantees that the reduction result is valid in thread 0.
+    // Broadcast the winning expert before the owning lane publishes its
+    // unbiased sigmoid score.
+    if (threadIdx.x == 0) winner_expert = winner.key;
+    __syncthreads();
+    if (valid_expert && expert == winner_expert) winner_score = score;
     __syncthreads();
     if (threadIdx.x == 0) {
       const int idx = k * row + k_idx;
       output[idx] = winner_score;
       indices[idx] =
-          is_pad_row ? static_cast<IndType>(-1) : static_cast<IndType>(winner.key);
+          is_pad_row ? static_cast<IndType>(-1)
+                     : static_cast<IndType>(winner_expert);
       source_rows[idx] = k_idx * num_rows + row;
       if (renormalize) selected_sum += output[idx];
     }
     __syncthreads();
-    if (valid_expert && expert == winner.key) choice = -FLT_MAX;
+    if (valid_expert && expert == winner_expert) choice = -FLT_MAX;
     __syncthreads();
   }
 
