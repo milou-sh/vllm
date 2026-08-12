@@ -59,6 +59,10 @@ _SM100F_TUNED_SPLITK_CONFIGS: dict[tuple[int, int], dict[int, tuple[int, int]]] 
 # SM90-specific tuned configs
 _SM90_TUNED_DOTPROD_BS: dict[tuple[int, int], dict[int, int]] = {
     (4096, 256): {M: 256 for M in (1, 3)},
+    # GLM-5.2-504B has 168 routed experts. These exact-shape H200 NVL
+    # measurements cycle all 75 router weights to avoid an L2-resident
+    # microbenchmark. The generic bs=128 path was 2.8--7.5% slower.
+    (6144, 168): {1: 256, 2: 512, 3: 512, 4: 512},
     (7168, 384): {M: 256 for M in (1, 2)},
 }
 _SM90_TUNED_SPLITK_CONFIGS: dict[tuple[int, int], dict[int, tuple[int, int]]] = {
@@ -68,6 +72,10 @@ _SM90_TUNED_SPLITK_CONFIGS: dict[tuple[int, int], dict[int, tuple[int, int]]] = 
         **{M: (8, 2) for M in (13, 16)},
         **{M: (8, 5) for M in (14, 15)},
     },
+    # split_k=8, stages=3 won by 2.5--3.4% over the generic (6, 4)
+    # dispatch for M=6..16. At M=5, (5, 5) was only 0.16% faster and
+    # (8, 3) is preferred to avoid compiling a one-off kernel variant.
+    (6144, 168): {M: (8, 3) for M in range(5, 17)},
     (7168, 256): {8: (6, 5)},
     (6144, 256): {M: (8, 2) for M in (9, 11)},
     (7168, 384): {
