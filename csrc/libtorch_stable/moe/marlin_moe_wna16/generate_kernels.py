@@ -98,6 +98,11 @@ QUANT_CONFIGS = [
         "thread_configs": THREAD_CONFIGS,
         "thread_m_blocks": THREAD_M_BLOCKS,
         "group_blocks": [1],
+        # Hopper GLM-5.2 has a narrow routed-row dimension but wide N=1024
+        # and N=6144 expert projections.  Keep the 64x256/256-thread schedule
+        # available for M tiles 8 and 16 so it can be measured and selected;
+        # the generic generator otherwise compiles it only for M tiles >16.
+        "small_batch_64x256": True,
     },
     # MXFP4
     {
@@ -181,6 +186,7 @@ def generate_new_kernels():
         all_group_blocks = quant_config["group_blocks"]
         all_m_blocks = quant_config["thread_m_blocks"]
         all_thread_configs = quant_config["thread_configs"]
+        small_batch_64x256 = quant_config.get("small_batch_64x256", False)
 
         for a_type, c_type in itertools.product(a_types, c_types):
             if not SUPPORT_FP8 and a_type == "kFE4M3fn":
@@ -200,10 +206,14 @@ def generate_new_kernels():
 
                 if threads == 256:
                     # for small batch (m_blocks == 1),
-                    #     we only need (128, 128, 256)
+                    #     we normally only need (128, 128, 256); selected
+                    #     quantization schemes can opt into (64, 256, 256)
                     # for large batch (m_blocks > 1),
                     #     we only need (64, 256, 256)
-                    if m_blocks <= 1 and (thread_k, thread_n) != (128, 128):
+                    small_configs = [(128, 128)]
+                    if small_batch_64x256:
+                        small_configs.append((64, 256))
+                    if m_blocks <= 1 and (thread_k, thread_n) not in small_configs:
                         continue
                     if m_blocks > 1 and (thread_k, thread_n) != (64, 256):
                         continue
