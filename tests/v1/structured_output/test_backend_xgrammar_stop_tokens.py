@@ -80,3 +80,20 @@ def test_request_stop_tokens_gated_to_grammar_terminal(backend: XgrammarBackend)
     assert _token_allowed(bm_override[0], LETTER)
     assert _token_allowed(bm_default[0], EOS)
     assert _token_allowed(bm_override[0], EOS)
+
+    # xgrammar 0.2.3 includes a request-specific terminal stop in the bitmask
+    # above but rejects it in GrammarMatcher.accept_token().  vLLM must still
+    # advance the request cleanly instead of converting the valid stop into an
+    # internal server error.
+    assert override.accept_tokens("req", [LETTER])
+    assert override.is_terminated()
+
+
+def test_request_stop_token_must_end_the_scheduler_block(backend: XgrammarBackend):
+    grammar = backend.compile_grammar(
+        StructuredOutputOptions.JSON,
+        '{"type": "string"}',
+        stop_token_ids={LETTER},
+    )
+    assert grammar.accept_tokens("req", [QUOTE, QUOTE])
+    assert not grammar.accept_tokens("req", [LETTER, QUOTE])

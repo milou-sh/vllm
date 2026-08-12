@@ -127,6 +127,7 @@ class XgrammarBackend(StructuredOutputBackend):
             ),
             vocab_size=self.vocab_size,
             ctx=ctx,
+            override_stop_tokens=frozenset(stop_token_ids or ()),
         )
 
     def allocate_token_bitmask(self, max_num_seqs: int):
@@ -148,6 +149,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
     vocab_size: int
     matcher: xgr.GrammarMatcher = field(hash=False)
     ctx: xgr.CompiledGrammar = field(hash=False)
+    override_stop_tokens: frozenset[int] = field(default_factory=frozenset)
     num_processed_tokens: int = field(
         default_factory=lambda: 0, repr=False, hash=False, init=False
     )
@@ -161,8 +163,20 @@ class XgrammarGrammar(StructuredOutputGrammar):
         """
         if self._is_terminated:
             return False
-        for token in tokens:
+        for index, token in enumerate(tokens):
             if not self.matcher.accept_token(token):
+                # xgrammar 0.2.3 exposes request-specific stop tokens in the
+                # terminal bitmask when they are passed as
+                # ``override_stop_tokens``, but does not consume those same
+                # tokens in ``accept_token``.  The scheduler then turns a
+                # perfectly valid terminal stop into FINISHED_ERROR.  Treat
+                # such a token as the terminal marker it was registered as.
+                # It must be the final accepted token in the scheduler block;
+                # accepting tokens after a stop would hide a real mismatch.
+                if token in self.override_stop_tokens and index == len(tokens) - 1:
+                    self.num_processed_tokens += 1
+                    self._is_terminated = True
+                    return True
                 logger.error(
                     "Failed to advance FSM for request %s "
                     "for tokens %s. Please file an issue.",
