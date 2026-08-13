@@ -54,6 +54,7 @@ VLLMDataTypeVLLMScalarTypeTag: dict[VLLMDataType | DataType, str] = {
     DataType.s8: "vllm::kS8",
     DataType.f16: "vllm::kFloat16",
     DataType.bf16: "vllm::kBfloat16",
+    DataType.e2m1: "vllm::kFE2M1f",
 }
 
 VLLMDataTypeTorchDataTypeTag: dict[VLLMDataType | DataType, str] = {

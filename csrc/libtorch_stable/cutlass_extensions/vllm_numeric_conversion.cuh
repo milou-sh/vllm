@@ -68,6 +68,43 @@ struct InterleavedNumericArrayConverter<
   result_type operator()(source_type const& s) const { return convert(s); }
 };
 
+// Machete prepacking stores each E2M1 register fragment in its
+// (2,4):(4,1) interleaved order. Match the existing uint4 -> BF16 converter's
+// result contract: for every eight packed values emit
+// [s0,s4,s1,s5,s2,s6,s3,s7]. Across the two K fragments of an NVFP4 group this
+// undoes the observed [0,8,2,10,...,7,15] logical-K permutation.
+template <FloatRoundStyle Round, int N>
+struct InterleavedNumericArrayConverter<Layout<Shape<_2, _4>, Stride<_4, _1>>,
+                                        cutlass::bfloat16_t,
+                                        cutlass::float_e2m1_t, N, Round, void> {
+  using Converter =
+      NumericArrayConverter<cutlass::bfloat16_t, cutlass::float_e2m1_t, N,
+                            Round>;
+  using result_type = typename Converter::result_type;
+  using source_type = typename Converter::source_type;
+
+  CUTLASS_DEVICE static result_type convert(source_type const& source) {
+    result_type result;
+    NumericConverter<cutlass::bfloat16_t, cutlass::float_e2m1_t, Round>
+        convert_scalar;
+    static_assert(N % 8 == 0);
+    CUTLASS_PRAGMA_UNROLL
+    for (int block = 0; block < N; block += 8) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int index = 0; index < 4; ++index) {
+        result[block + 2 * index] = convert_scalar(source[block + index]);
+        result[block + 2 * index + 1] =
+            convert_scalar(source[block + index + 4]);
+      }
+    }
+    return result;
+  }
+
+  CUTLASS_DEVICE result_type operator()(source_type const& source) const {
+    return convert(source);
+  }
+};
+
 template <typename RegConvert32bit, typename T, typename S, int N>
 struct ArrayConverterPacked32Bit {
   using result_type = Array<T, N>;

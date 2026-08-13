@@ -61,8 +61,15 @@ struct MacheteKernelTemplate {
       cute::conditional_t<with_group_zeropoints, GroupZeroT, MmaType>;
   using ElementSGroup =
       cute::conditional_t<with_group_scales, GroupScaleT, MmaType>;
-  using ElementConvertGroup =
-      cute::conditional_t<with_group_scales, GroupScaleT, MmaType>;
+  static constexpr bool is_nvfp4_group_scale =
+      std::is_same_v<ElementB, cutlass::float_e2m1_t> &&
+      std::is_same_v<GroupScaleT, cutlass::float_e4m3_t>;
+  // Preserve the established scale-typed conversion path for every existing
+  // Machete instantiation. Only NVFP4 widens both E2M1 values and E4M3 scales
+  // to the BF16 tensor-core input type before multiplying them.
+  using ElementConvertGroup = cute::conditional_t<
+      is_nvfp4_group_scale, MmaType,
+      cute::conditional_t<with_group_scales, GroupScaleT, MmaType>>;
   using ElementSChannel =
       cute::conditional_t<with_channel_scales, ChannelScaleT, AccumulatorT>;
   using ElementSToken =

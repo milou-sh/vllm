@@ -146,10 +146,20 @@ struct MacheteCollectiveMma {
                 "registers.");
 
  public:
-  static constexpr int PipelineStages =
-      compute_stage_count_or_override_single_affine_transformed_input<
-          sm90_smem_capacity_bytes, ElementA, ElementB, ElementScale,
-          ElementZero, TileShape_MNK>(StageCountType{});
+  static constexpr bool IsNvfp4Group16 =
+      cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
+      cute::is_same_v<ElementScale, cutlass::float_e4m3_t> &&
+      cute::is_same_v<ElementB, cutlass::bfloat16_t>;
+  // CUTLASS' generic affine-input stage calculator accounts for one scale row
+  // per K tile. NVFP4 group-size 16 needs four rows for Machete's K=64 tile,
+  // so the generic result can exceed Hopper's 232 KiB shared-memory limit.
+  // Start from a conservative liveness/correctness value; tune this after the
+  // numerical gate succeeds.
+  static constexpr int PipelineStages = IsNvfp4Group16
+      ? 2
+      : compute_stage_count_or_override_single_affine_transformed_input<
+            sm90_smem_capacity_bytes, ElementA, ElementB, ElementScale,
+            ElementZero, TileShape_MNK>(StageCountType{});
 
   struct DispatchPolicy {
     constexpr static int Stages = PipelineStages;
@@ -177,8 +187,16 @@ struct MacheteCollectiveMma {
                                 decltype(cute::get<0>(TileShape_MNK{})),
                                 decltype(cute::get<2>(TileShape_MNK{}))>());
 
-  using SmemLayoutAtomScale = Layout<
-      Shape<decltype(cute::shape<0>(SmemLayoutAtomARowMajor{})), cute::Int<1>>>;
+  static constexpr int ScaleGroupsPerTile = IsNvfp4Group16 ? 4 : 1;
+  // Hopper TMA requires both a 16-byte contiguous box and 128-byte-aligned
+  // shared-memory destinations.  A 16x4 E4M3 atom produces 64-byte subtiles,
+  // so the second TMA load lands at base+64 and traps.  A 32x4 atom makes every
+  // scale subtile exactly 128 bytes while retaining the compact Mx4 storage.
+  using ScaleAtomM = cute::conditional_t<
+      IsNvfp4Group16, cute::Int<32>,
+      decltype(cute::shape<0>(SmemLayoutAtomARowMajor{}))>;
+  using SmemLayoutAtomScale = Layout<Shape<
+      ScaleAtomM, cute::Int<ScaleGroupsPerTile>>>;
 
   using SmemLayoutAtomB =
       decltype(rs_smem_selector<GmmaMajorB, ElementB,
@@ -307,6 +325,22 @@ struct MacheteCollectiveMma {
       make_shape(shape<0>(ScaleTileShape{}), shape<1>(ScaleTileShape{}),
                  Int<PipelineStages>{})));
 
+  // TMA stores NVFP4 scales compactly as Mx4. Consumers need an affine K=64
+  // view congruent with the weight fragment: each scale is repeated for its
+  // 16-value quantization group using a zero-stride inner K mode.
+  using SmemLayoutScaleMma = cute::conditional_t<
+      IsNvfp4Group16,
+      decltype(make_layout(
+          make_shape(shape<0>(SmemLayoutScale{}),
+                     make_shape(cute::Int<16>{},
+                                shape<1>(SmemLayoutScale{})),
+                     shape<2>(SmemLayoutScale{})),
+          make_stride(stride<0>(SmemLayoutScale{}),
+                      make_stride(cute::Int<0>{},
+                                  stride<1>(SmemLayoutScale{})),
+                      stride<2>(SmemLayoutScale{})))),
+      SmemLayoutScale>;
+
   // If A mn-layout and B mn-layout, transposing B matrix since WGMMA is k-major
   // only (e.g. tf32, fp32, fp8, int8).
   static constexpr bool IsLayoutAmnBmn =
@@ -337,13 +371,8 @@ struct MacheteCollectiveMma {
       conditional_t<::cutlass::gemm::detail::is_major<0, StrideB>(),
                     Step<_2, _1, _3>, Step<_1, _2, _3>>{}));
 
-  // These two restrictions are related, so we place the assertions together.
-  // To relax them, we need to handle loading more than 1 row of scales for
-  // every main loop iteration. We must also handle updating the pipeline
-  // transaction bytes on the fly. NOTE: Deleting this assertion without
-  // required changes will cause the code to hang.
-  static_assert(size<1>(SmemLayoutAtomScale{}) == 1,
-                "size<1>(SmemLayoutAtomScale) must be 1.");
+  static_assert(size<1>(SmemLayoutAtomScale{}) == 1 || IsNvfp4Group16,
+                "Multiple scale rows are only implemented for NVFP4 K=16.");
 
  private:
   static constexpr ConversionMode get_conversion_mode() {
@@ -644,7 +673,10 @@ struct MacheteCollectiveMma {
       const int scale_k = (K + args.group_size - 1) / args.group_size;
       constexpr int min_tma_aligned_elements_scale = tma_alignment_bits / cutlass::sizeof_bits<ElementScale>::value;
       implementable = implementable && cutlass::detail::check_alignment<min_tma_aligned_elements_scale>(cute::make_shape(scale_mn,scale_k,L), StrideScale{});
-      implementable = implementable && (args.group_size == K || ((args.group_size % size<2>(TileShape{})) == 0));
+      implementable = implementable &&
+          (IsNvfp4Group16 ? args.group_size == 16
+                          : (args.group_size == K ||
+                             ((args.group_size % size<2>(TileShape{})) == 0)));
       implementable = implementable && args.group_size != 0;
       implementable = implementable && (args.ptr_S != nullptr);
 
@@ -883,8 +915,12 @@ struct MacheteCollectiveMma {
           // on the fly.
           // We must do a ceiling divide here to correctly handle with group_size == K. In that case, we don't require that K
           // is a multiple of the threadblock tile K
-          const int ReloadFactor = (mainloop_params.group_size + size<2>(TileShape{}) - 1) / size<2>(TileShape{});
-          const int scale_load_k = *k_tile_iter / ReloadFactor; // This will always be 0 when group_size == K.
+          const int ReloadFactor =
+              (mainloop_params.group_size + size<2>(TileShape{}) - 1) /
+              size<2>(TileShape{});
+          const int scale_load_k = IsNvfp4Group16
+              ? *k_tile_iter
+              : *k_tile_iter / ReloadFactor; // Always 0 when group_size == K.
           copy(mainloop_params.tma_load_scale.with(*tma_barrier, mcast_mask_s), tSgS(_,_,_,scale_load_k), tSsS(_,_,_,write_stage));
 
           if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
@@ -1062,7 +1098,11 @@ struct MacheteCollectiveMma {
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
         if (k_block < K_BLOCK_MAX - 1) {
-          convert_A(k_block + 1, smem_pipe_read.index());
+          // The remaining K blocks belong to the current tile. smem_pipe_read
+          // has already advanced to the next pipeline stage, so using its
+          // index here associates current weights with next-tile group scales
+          // when a tile contains more than one quantization group.
+          convert_A(k_block + 1, read_stage);
         }
         warpgroup_arrive();
         // (V,M) x (V,N) => (V,M,N)
@@ -1257,7 +1297,7 @@ struct MacheteCollectiveMma {
       return cute::make_tuple();
     }
     else if constexpr (ModeHasScales) {
-      Tensor sS = make_tensor(make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});// (BLK_M,BLK_SCALE_K,PIPE)
+      Tensor sS = make_tensor(make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScaleMma{});// (BLK_M,BLK_K,PIPE)
       Tensor tCsS = mma_thread_slice.partition_A(sS);
       Tensor tCrS = make_tensor<ElementScale>(mma_thread_slice.partition_fragment_A(sS(_,_,Int<0>{})).shape()); 
 
@@ -1265,7 +1305,7 @@ struct MacheteCollectiveMma {
         return cute::make_tuple(tCsS, tCrS);
       }
       else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        Tensor sZ = make_tensor(make_smem_ptr(shared_tensors.smem_zero.begin()), SmemLayoutScale{});// (BLK_M,BLK_SCALE_K,PIPE)
+        Tensor sZ = make_tensor(make_smem_ptr(shared_tensors.smem_zero.begin()), SmemLayoutScaleMma{});// (BLK_M,BLK_K,PIPE)
         Tensor tCsZ = mma_thread_slice.partition_A(sZ);
         Tensor tCrZ = make_tensor<ElementZero>(mma_thread_slice.partition_fragment_A(sZ(_,_,Int<0>{})).shape()); 
         return cute::make_tuple(tCsS, tCrS, tCsZ, tCrZ);
@@ -1296,19 +1336,28 @@ struct MacheteCollectiveMma {
       return cute::make_tuple();
     }
     else if constexpr (ModeHasScales) {
-      auto smem_tiled_copy_S = make_tiled_copy_A(SmemCopyAtomScale{}, tiled_mma);
-      auto smem_thr_copy_S   = smem_tiled_copy_S.get_thread_slice(warp_group_thread_idx);
-      Tensor tCrS_copy_view  = smem_thr_copy_S.retile_D(cute::get<1>(partitioned_extra_info));        // (CPY,CPY_M,CPY_K)
-      
-      if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return cute::make_tuple(smem_tiled_copy_S, tCrS_copy_view);
-      } 
-      else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        Tensor tCrZ_copy_view  = smem_thr_copy_S.retile_D(cute::get<3>(partitioned_extra_info));      // (CPY,CPY_M,CPY_K)
-        return cute::make_tuple(smem_tiled_copy_S, tCrS_copy_view, tCrZ_copy_view);
-      } 
-      else {
-        static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
+      if constexpr (IsNvfp4Group16) {
+        // The compact scale tensor is intentionally presented through a
+        // zero-stride K=16 broadcast view.  Its source layout is not
+        // injective, so a generic tiled copy may infer an aligned vector load
+        // from an address that aliases a single E4M3 byte.  NVFP4 loads these
+        // four scale bytes explicitly below instead.
+        return cute::make_tuple();
+      } else {
+        auto smem_tiled_copy_S = make_tiled_copy_A(SmemCopyAtomScale{}, tiled_mma);
+        auto smem_thr_copy_S   = smem_tiled_copy_S.get_thread_slice(warp_group_thread_idx);
+        Tensor tCrS_copy_view  = smem_thr_copy_S.retile_D(cute::get<1>(partitioned_extra_info));        // (CPY,CPY_M,CPY_K)
+
+        if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+          return cute::make_tuple(smem_tiled_copy_S, tCrS_copy_view);
+        }
+        else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+          Tensor tCrZ_copy_view  = smem_thr_copy_S.retile_D(cute::get<3>(partitioned_extra_info));      // (CPY,CPY_M,CPY_K)
+          return cute::make_tuple(smem_tiled_copy_S, tCrS_copy_view, tCrZ_copy_view);
+        }
+        else {
+          static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
+        }
       }
     } 
     else {
@@ -1324,27 +1373,66 @@ struct MacheteCollectiveMma {
   // Load scales and zeros into registers if required
   template <class... Ts, class... Us>
   CUTLASS_DEVICE void load_extra_info_to_registers(
-      cute::tuple<Ts...> const& partitioned_mma_extra_info,
+      cute::tuple<Ts...>& partitioned_mma_extra_info,
       cute::tuple<Us...> const& tiled_copy_and_views, int k_block,
       int read_stage) {
-    if (k_block == 0) {
+    if (k_block == 0 || IsNvfp4Group16) {
       // We are starting a new k-tile so copy the scale
       if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
         // nothing to do
       } else if constexpr (ModeHasScales) {
-        auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
-        auto tCrS_copy_view = cute::get<1>(tiled_copy_and_views);
-        auto tCsS = cute::get<0>(partitioned_mma_extra_info);
-        copy(smem_tiled_copy_S, tCsS(_, _, k_block, read_stage),
-             tCrS_copy_view(_, _, k_block));
+        if constexpr (IsNvfp4Group16) {
+          auto tCsS = cute::get<0>(partitioned_mma_extra_info);
+          auto& tCrS = cute::get<1>(partitioned_mma_extra_info);
+          auto source = coalesce(tCsS(_, _, k_block, read_stage));
+          auto destination = coalesce(tCrS(_, _, k_block));
+          CUTE_STATIC_ASSERT_V(size(source) == size(destination));
+          CUTLASS_PRAGMA_UNROLL
+          for (int element = 0; element < size(destination); ++element) {
+            destination(element) = source(element);
+          }
+#if defined(VLLM_MACHETE_NVFP4_SCALE_LOAD_DIAGNOSTIC)
+          if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
+              threadIdx.x == 128) {
+            printf("NVFP4 scale load k_block=%d count=%d source=", k_block,
+                   int(size(source)));
+            for (int element = 0; element < size(source); ++element) {
+              printf(" %.6g", float(source(element)));
+            }
+            printf(" destination=");
+            for (int element = 0; element < size(destination); ++element) {
+              printf(" %.6g", float(destination(element)));
+            }
+            printf("\n");
+          }
+#endif
+        } else {
+          auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
+          auto tCrS_copy_view = cute::get<1>(tiled_copy_and_views);
+          auto tCsS = cute::get<0>(partitioned_mma_extra_info);
+          copy(smem_tiled_copy_S, tCsS(_, _, 0, read_stage),
+               tCrS_copy_view(_, _, 0));
+        }
         if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
           // Nothing extra to do
         } else if constexpr (KernelConversionMode ==
                              ConversionMode::ConvertAndScaleWithZero) {
           auto tCsZ = cute::get<2>(partitioned_mma_extra_info);
-          auto tCrZ_copy_view = cute::get<2>(tiled_copy_and_views);
-          copy(smem_tiled_copy_S, tCsZ(_, _, k_block, read_stage),
-               tCrZ_copy_view(_, _, k_block));
+          if constexpr (IsNvfp4Group16) {
+            auto& tCrZ = cute::get<3>(partitioned_mma_extra_info);
+            auto source = coalesce(tCsZ(_, _, k_block, read_stage));
+            auto destination = coalesce(tCrZ(_, _, k_block));
+            CUTE_STATIC_ASSERT_V(size(source) == size(destination));
+            CUTLASS_PRAGMA_UNROLL
+            for (int element = 0; element < size(destination); ++element) {
+              destination(element) = source(element);
+            }
+          } else {
+            auto smem_tiled_copy_S = cute::get<0>(tiled_copy_and_views);
+            auto tCrZ_copy_view = cute::get<2>(tiled_copy_and_views);
+            copy(smem_tiled_copy_S, tCsZ(_, _, k_block, read_stage),
+                 tCrZ_copy_view(_, _, k_block));
+          }
         } else {
           static_assert(cutlass::detail::dependent_false<KernelSchedule>,
                         "Conversion mode not handled in A -> RF path.");
@@ -1374,18 +1462,62 @@ struct MacheteCollectiveMma {
     } else if constexpr (ModeHasScales) {
       auto tCrS = cute::get<1>(partitioned_extra_info);
       auto converted_inputs =
-          make_fragment_like<ElementScale>(tCrA_mma)(_, _, k_block);
-      auto scales = tCrS(_, _, 0);
+          make_fragment_like<ElementMma>(tCrA_mma)(_, _, k_block);
+      auto packed_scales = tCrS(_, _, IsNvfp4Group16 ? k_block : 0);
+      // Keep the exact CUTE layout of the source fragment: convert_tensor's
+      // vectorized converter deliberately requires identical layouts.
+      auto scales = make_tensor_like<ElementMma>(packed_scales);
 
       // First, we upcast the inputs to the scale type
       convert_tensor<IlvdBlkLayout>(in, converted_inputs, vec_A);
+      if constexpr (IsNvfp4Group16) {
+        auto packed_linear = coalesce(packed_scales);
+        auto scales_linear = coalesce(scales);
+        CUTE_STATIC_ASSERT_V(size(packed_linear) == size(scales_linear));
+#if defined(VLLM_MACHETE_NVFP4_SCALE_ONE_DIAGNOSTIC)
+        CUTLASS_PRAGMA_UNROLL
+        for (int element = 0; element < size(scales_linear); ++element) {
+          scales_linear(element) = ElementMma(1.0f);
+        }
+#else
+        CUTLASS_PRAGMA_UNROLL
+        for (int element = 0; element < size(scales_linear); ++element) {
+          // CUTLASS has no E4M3 -> BF16 NumericConverter specialization; the
+          // unspecialized converter silently yielded zero on SM90. E4M3 is
+          // exactly representable in BF16, so use its supported float
+          // conversion followed by the BF16 constructor.
+          scales_linear(element) =
+              ElementMma(float(packed_linear(element)));
+        }
+#endif
+      } else {
+        convert_tensor<void>(packed_scales, scales);
+      }
+#if defined(VLLM_MACHETE_NVFP4_SCALE_APPLY_DIAGNOSTIC)
+      if constexpr (IsNvfp4Group16) {
+        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
+            threadIdx.x == 128) {
+          auto inputs_linear = coalesce(converted_inputs);
+          auto scales_linear = coalesce(scales);
+          printf("NVFP4 scale apply k_block=%d inputs_before=", k_block);
+          for (int element = 0; element < size(inputs_linear); ++element) {
+            printf(" %.6g", float(inputs_linear(element)));
+          }
+          printf(" scales=");
+          for (int element = 0; element < size(scales_linear); ++element) {
+            printf(" %.6g", float(scales_linear(element)));
+          }
+          printf("\n");
+        }
+      }
+#endif
       // Apply scales and broadcast across inputs, store in converted_inputs
 
       // We need to cast to nv_bfloat16 for the multiply since
       // `cutlass::bfloat16_t` has an overloaded operator* that upconverts to
       // float, which nvcc will not optimize to using vectorized fma
       // instructions (i.e. hfma.bf16_v2)
-      if constexpr (std::is_same_v<ElementScale, cutlass::bfloat16_t>) {
+      if constexpr (std::is_same_v<ElementMma, cutlass::bfloat16_t>) {
         cute::transform(
             recast<nv_bfloat16>(converted_inputs), recast<nv_bfloat16>(scales),
             recast<nv_bfloat16>(converted_inputs), cute::multiplies{});
@@ -1393,6 +1525,19 @@ struct MacheteCollectiveMma {
         cute::transform(converted_inputs, scales, converted_inputs,
                         cute::multiplies{});
       }
+#if defined(VLLM_MACHETE_NVFP4_SCALE_APPLY_DIAGNOSTIC)
+      if constexpr (IsNvfp4Group16) {
+        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
+            threadIdx.x == 128) {
+          auto inputs_linear = coalesce(converted_inputs);
+          printf("NVFP4 scale apply k_block=%d inputs_after=", k_block);
+          for (int element = 0; element < size(inputs_linear); ++element) {
+            printf(" %.6g", float(inputs_linear(element)));
+          }
+          printf("\n");
+        }
+      }
+#endif
 
       // Apply zeros if required
       if constexpr (KernelConversionMode ==

@@ -214,6 +214,14 @@ namespace machete {
 
 torch::stable::Tensor prepack_B_dispatch(PrepackBArgs args) {
   auto convert_type = args.maybe_group_scales_type.value_or(args.a_type);
+  // NVFP4 uses E4M3 group scales but widens both the E2M1 weight and the scale
+  // to the activation type before multiplication. Its prepacked weight layout
+  // must therefore be selected with the activation conversion type.
+  if (args.b_type == vllm::kFE2M1f &&
+      args.maybe_group_scales_type ==
+          torch::headeronly::ScalarType::Float8_e4m3fn) {
+    convert_type = args.a_type;
+  }
   {%- for t in types %}
   {% set b_type = unsigned_type_with_bitwidth(t.b_num_bits) %}
   if (args.a_type == {{TorchTypeTag[t.a]}}
@@ -417,9 +425,13 @@ def create_sources(impl_configs: list[ImplConfig], num_impl_files=8):
 
     prepack_types = []
     for impl_config in impl_configs:
+        is_nvfp4 = (
+            impl_config.types.b == DataType.e2m1
+            and impl_config.types.b_group_scale == DataType.e4m3
+        )
         convert_type = (
             impl_config.types.a
-            if impl_config.types.b_group_scale == DataType.void
+            if impl_config.types.b_group_scale == DataType.void or is_nvfp4
             else impl_config.types.b_group_scale
         )
         prepack_types.append(
@@ -573,6 +585,34 @@ def generate():
             itertools.repeat(get_unique_schedules(default_heuristic)),
             itertools.repeat(default_heuristic),
         )
+    ]
+
+    # Hopper NVFP4 checkpoint path: E2M1 weights, E4M3 microscale every K=16,
+    # BF16 activations/output.  The specialized Machete mainloop loads four
+    # scales for each K=64 WGMMA tile and applies one per K=16 sub-block.
+    NVFP4_kernel_type_configs = [
+        TypeConfig(
+            a=DataType.bf16,
+            b=DataType.e2m1,
+            b_group_scale=DataType.e4m3,
+            b_group_zeropoint=DataType.void,
+            b_channel_scale=DataType.void,
+            a_token_scale=DataType.void,
+            out=DataType.bf16,
+            accumulator=DataType.f32,
+        )
+    ]
+    # The 256x16 Stream-K schedule currently returns kErrorInternal for the
+    # Hopper E2M1 mainloop.  Keep it available to the established integer
+    # Machete paths, but do not advertise or dispatch it for NVFP4.
+    nvfp4_heuristic = [
+        (condition, schedule)
+        for condition, schedule in default_heuristic
+        if schedule.tile_shape_mn != (256, 16)
+    ]
+    impl_configs += [
+        ImplConfig(x, get_unique_schedules(nvfp4_heuristic), nvfp4_heuristic)
+        for x in NVFP4_kernel_type_configs
     ]
 
     AWQ_kernel_type_configs = list(
