@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from fnmatch import fnmatch
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -184,10 +185,14 @@ class ModelOptQuantConfigBase(QuantizationConfig):
         # handle exclusion
         if self.is_layer_excluded(prefix):
             if isinstance(layer, (LinearBase, ParallelLMHead)):
-                if any(
-                    fnmatch(prefix, pattern)
-                    for pattern in envs.VLLM_MODELOPT_ONLINE_FP8_PATTERNS
-                ):
+                online_fp8_patterns = (
+                    pattern.strip()
+                    for pattern in os.environ.get(
+                        "VLLM_MODELOPT_ONLINE_FP8_PATTERNS", ""
+                    ).split(",")
+                    if pattern.strip()
+                )
+                if any(fnmatch(prefix, pattern) for pattern in online_fp8_patterns):
                     from vllm.model_executor.layers.quantization.online.fp8 import (
                         Fp8PerTensorOnlineLinearMethod,
                     )
