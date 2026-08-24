@@ -35,6 +35,9 @@ def sample_tools():
             function=FunctionDefinition(name="get_current_date", parameters={}),
         ),
         ChatCompletionToolsParam(
+            function=FunctionDefinition(name="grep_tool", parameters={}),
+        ),
+        ChatCompletionToolsParam(
             function=FunctionDefinition(
                 name="get_weather",
                 parameters={
@@ -150,6 +153,43 @@ class TestGlm47ExtractToolCalls:
         r = glm47_tool_parser.extract_tool_calls(out, request=mock_request)
         assert r.tools_called
         assert json.loads(r.tool_calls[0].function.arguments) == {"city": "Beijing"}
+
+    def test_missing_arg_key_start_same_line(self, glm47_tool_parser, mock_request):
+        out = "<tool_call>get_weathercity</arg_key><arg_value>Beijing</arg_value></tool_call>"
+        r = glm47_tool_parser.extract_tool_calls(out, request=mock_request)
+        assert r.tools_called
+        assert r.tool_calls[0].function.name == "get_weather"
+        assert json.loads(r.tool_calls[0].function.arguments) == {"city": "Beijing"}
+
+    def test_missing_arg_key_start_with_space(self, glm47_tool_parser, mock_request):
+        out = "<tool_call>get_weather city</arg_key><arg_value>Beijing</arg_value></tool_call>"
+        r = glm47_tool_parser.extract_tool_calls(out, request=mock_request)
+        assert r.tools_called
+        assert r.tool_calls[0].function.name == "get_weather"
+        assert json.loads(r.tool_calls[0].function.arguments) == {"city": "Beijing"}
+
+    def test_missing_arg_key_start_with_following_args(
+        self, glm47_tool_parser, mock_request
+    ):
+        out = (
+            "<tool_call>get_weathercity</arg_key><arg_value>Beijing</arg_value>"
+            "<arg_key>date</arg_key><arg_value>today</arg_value></tool_call>"
+        )
+        r = glm47_tool_parser.extract_tool_calls(out, request=mock_request)
+        assert r.tools_called
+        assert json.loads(r.tool_calls[0].function.arguments) == {
+            "city": "Beijing",
+            "date": "today",
+        }
+
+    def test_glued_grep_tool_glob(self, glm47_tool_parser, mock_request):
+        out = (
+            "<tool_call>grep_toolglob</arg_key><arg_value>*.cs</arg_value></tool_call>"
+        )
+        r = glm47_tool_parser.extract_tool_calls(out, request=mock_request)
+        assert r.tools_called
+        assert r.tool_calls[0].function.name == "grep_tool"
+        assert json.loads(r.tool_calls[0].function.arguments) == {"glob": "*.cs"}
 
     def test_args_with_newlines(self, glm47_tool_parser, mock_request):
         out = "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n</tool_call>"
