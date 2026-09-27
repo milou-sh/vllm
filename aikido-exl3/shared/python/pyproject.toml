@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aikido-exl3"
+version = "0.0.1"
+description = "EXL3 (ExLlamaV3 trellis) quantization for stock vLLM"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+# The format layer is pure Python on purpose: no runtime deps here.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.entry-points."vllm.general_plugins"]
+aikido_exl3 = "aikido_exl3.vllm_glue.plugin:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
