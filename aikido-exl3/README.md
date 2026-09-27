@@ -16,4 +16,15 @@ Everything is off by default. `AIKIDO_EXL3_HOPPER_MOE` and the `AIKIDO_NONMOE_*`
 Decoded weights must stay bit-identical to ExLlamaV3 `reconstruct`; that parity is the gate for every kernel change.
 Third-party code and licences are listed in `NOTICE`.
 
-Aikido Box builds its vLLM image from a pinned commit of this directory; see `docker/vllm` in `AikidoSec/aikido-box`.
+## Image
+
+`Dockerfile` builds the serving image on the digest-pinned stock `vllm/vllm-openai:v0.29.0`. Build it on an x86_64
+host (the kernels compile for sm_90; no GPU needed) and publish it tagged with this fork's commit:
+
+```bash
+tag=ghcr.io/milou-sh/vllm-openai:v0.29.0-glm53-exl3-$(git rev-parse --short=7 HEAD)
+docker build --platform=linux/amd64 -t "$tag" aikido-exl3
+docker push "$tag"
+```
+
+Aikido Box ships the published image by digest (`THIRD_PARTY_IMAGES` in `scripts/build-platform-release.py`).
