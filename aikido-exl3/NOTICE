@@ -1,0 +1,5 @@
+aikido-exl3 includes or derives from:
+- vLLM Marlin kernels (Apache-2.0, Neural Magic / vLLM project): kernels/hopper/exl3_hopper_template.h, kernels/hopper/third_party/marlin
+- ExLlamaV3 (MIT, Copyright (c) 2025 Turboderp): kernels/hopper/third_party/exllamav3, decode routines in kernels/hopper/exl3_decode.cuh,
+  patches in kernels/exllamav3-reference; calling conventions in shared/python/src/aikido_exl3/kernels/reference.py
+- yeasah/exllamav3 commit dc1dc239 (MIT): the sm_90 MGEMM barrier gate; yeasah/vllm-exl3-plugin (Apache-2.0): mgemm MoE calling convention

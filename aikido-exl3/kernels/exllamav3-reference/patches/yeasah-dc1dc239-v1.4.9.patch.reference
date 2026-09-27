@@ -1,0 +1,132 @@
+From dc1dc239727ef3f8045a575217a87e3942606ea4 Mon Sep 17 00:00:00 2001
+From: Yeasah Pell <ypell@cuda.eng.comrex.com>
+Date: Sat, 8 Aug 2026 19:48:51 -0400
+Subject: [PATCH] Gate the sm_90+ MGEMM sense-reversing barrier behind
+ EXL3_SM90_BARRIER
+
+exl3_mgemm_kernel synchronizes its blocks with a hand-rolled
+sense-reversing barrier (group_barrier over gridDim.x, one group per
+blockIdx.z) on sm_90+, instead of cooperative-groups grid.sync(). It
+synchronizes through the device-global `locks` buffer, which is
+shared across every launch and zeroed only once at allocation - and
+it deadlocks under vLLM: MoE models hang mid-generation with the GPU
+pinned at 100%.
+
+Off by default now; build with EXL3_SM90_BARRIER=1 to opt back in.
+Also adds an EXL3_DIAG_GRID diagnostic (grid size vs. actual resident
+capacity per cudaOccupancyMaxActiveBlocksPerMultiprocessor) for
+tracking down cooperative-launch sizing issues generally, and wraps
+the launch in cuda_check() so a bad launch surfaces as an error
+instead of a silent hang.
+
+Previously carried as an out-of-tree patch
+(patches/exllamav3-sm90-barrier.patch) against upstream; folded
+directly into history now that this fork exists to hold it.
+---
+ exllamav3/exllamav3_ext/quant/exl3_gemm.cu    | 28 +++++++++++++++++--
+ .../exllamav3_ext/quant/exl3_gemm_kernel.cuh  |  6 ++--
+ setup.py                                      | 10 +++++++
+ 3 files changed, 39 insertions(+), 5 deletions(-)
+
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
+index f36a43fc3..beb57eb99 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
+@@ -1,3 +1,5 @@
++#include <cstdio>
++#include <cstdlib>
+ #include <cuda_fp16.h>
+ #include "exl3_gemm.cuh"
+
+@@ -613,7 +615,29 @@ int exl3_mgemm_gr
+         kernel_attr_set[device].insert((void*) kernel);
+     }
+
+-    cudaLaunchCooperativeKernel
++    // exl3_mgemm_kernel synchronizes its blocks with a sense-reversing barrier
++    // (group_barrier over gridDim.x, one group per blockIdx.z), so every block
++    // of the grid must be resident simultaneously or the survivors spin
++    // forever. The grid above is sized on the assumption that one block occupies
++    // one SM; if the kernel's real occupancy is lower, that assumption is wrong
++    // and the launch deadlocks rather than failing. Report what actually fits.
++    static const bool exl3_diag = getenv("EXL3_DIAG_GRID") != nullptr;
++    if (exl3_diag)
++    {
++        int blocks_per_sm = 0;
++        cudaOccupancyMaxActiveBlocksPerMultiprocessor
++            (&blocks_per_sm, (void*) kernel, block_dim, SMEM_MAX);
++        int grid_blocks = num_sms * concurrency;
++        int resident_max = blocks_per_sm * total_sms;
++        printf("[exl3 grid] m=%d k=%d n=%d K=%d bszm=%d/%d shape=%d bdim=%d "
++               "grid=%dx%d=%d blocks_per_sm=%d resident_max=%d smem=%d%s\n",
++               size_m, size_k, size_n, K, bszm_in, bszm_out, shape_idx, block_dim,
++               num_sms, concurrency, grid_blocks, blocks_per_sm, resident_max,
++               (int) SMEM_MAX, grid_blocks > resident_max ? "  <-- CANNOT BE CO-RESIDENT" : "");
++        fflush(stdout);
++    }
++
++    cuda_check(cudaLaunchCooperativeKernel
+     (
+         (void*) kernel,
+         block_grid,
+@@ -621,7 +645,7 @@ int exl3_mgemm_gr
+         kernelArgs,
+         SMEM_MAX,
+         stream
+-    );
++    ));
+     add_graph_args((void*) kernel);
+
+     cuda_check(cudaPeekAtLastError());
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_gemm_kernel.cuh b/exllamav3/exllamav3_ext/quant/exl3_gemm_kernel.cuh
+index 17132d0cb..acfa31e36 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_gemm_kernel.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_gemm_kernel.cuh
+@@ -92,7 +92,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
+     int bszm = MAX(bszm_in, bszm_out);
+     auto grid = cg::this_grid();
+
+-    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
++    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890) && defined(EXL3_SM90_BARRIER)
+         int* barrier_counters_sense = locks + BARRIER_LOCKS_OFFSET;
+     #endif
+
+@@ -163,7 +163,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
+                 );
+         }
+
+-        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
++        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890) && defined(EXL3_SM90_BARRIER)
+             group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
+         #else
+             grid.sync();
+@@ -198,7 +198,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
+             else                  C_ = (void*) (((half*) C_) + 16 * n_j);
+             size_m_ -= 16;
+
+-            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
++            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890) && defined(EXL3_SM90_BARRIER)
+                 group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
+             #else
+                 grid.sync();
+diff --git a/setup.py b/setup.py
+index ae33064f3..9870f3e05 100644
+--- a/setup.py
++++ b/setup.py
+@@ -48,6 +48,16 @@
+ if torch and torch_version.hip:
+     extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
+
++# On sm_90+ the GEMM kernels can use a hand-rolled sense-reversing barrier
++# (group_barrier) in place of cooperative-groups grid.sync(). It synchronizes
++# through the device-global `locks` buffer, which is shared across every launch
++# and zeroed only once at allocation, and it deadlocks under vLLM: MoE models
++# hang mid-generation with the GPU pinned at 100%. Off by default here; set
++# EXL3_SM90_BARRIER=1 to build with it.
++if os.environ.get("EXL3_SM90_BARRIER"):
++    extra_cuda_cflags += ["-DEXL3_SM90_BARRIER"]
++    extra_cflags += ["-DEXL3_SM90_BARRIER"]
++
+ extra_compile_args = {
+     "cxx": extra_cflags,
+     "nvcc": extra_cuda_cflags,
